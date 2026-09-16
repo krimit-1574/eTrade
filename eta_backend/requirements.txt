@@ -1,0 +1,9 @@
+google-genai
+requests
+fpdf
+yfinance
+pandas
+fastapi
+python-dotenv
+uvicorn
+scikit-learn
