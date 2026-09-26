@@ -213,7 +213,7 @@ export const RiskEngine = {
    * Comprehensive Pre-Trade Validation Gate.
    * Checks all 12+ institutional risk rules before allowing order execution.
    */
-  validateTrade({ account, decision, stockInfo, marketState, customSettings }) {
+  validateTrade({ account, decision, stockInfo, marketState, customSettings, currentTime }) {
     const settings = customSettings || this.loadSettings();
 
     // 1. Trade direction & decision validity
@@ -222,36 +222,39 @@ export const RiskEngine = {
     }
 
     // 2. Market State: Hours & Cutoff Time (IST: UTC + 5:30)
-    const now = new Date();
-    const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
-    const ist = new Date(utc + (3600000 * 5.5));
-    const day = ist.getDay(); // 0 = Sun, 6 = Sat
-    const currentTimeNum = ist.getHours() * 100 + ist.getMinutes();
+    const bypassMarketHours = marketState?.bypassMarketHours || settings.bypassMarketHours || customSettings?.bypassMarketHours;
+    if (!bypassMarketHours) {
+      const now = currentTime ? new Date(currentTime) : new Date();
+      const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+      const ist = new Date(utc + (3600000 * 5.5));
+      const day = ist.getDay(); // 0 = Sun, 6 = Sat
+      const currentTimeNum = ist.getHours() * 100 + ist.getMinutes();
 
-    const [startH, startM] = (settings.tradingStartTime || '09:15').split(':').map(Number);
-    const [cutoffH, cutoffM] = (settings.intradayCutoffTime || '15:15').split(':').map(Number);
-    const startTimeNum = startH * 100 + startM;
-    const cutoffTimeNum = cutoffH * 100 + cutoffM;
+      const [startH, startM] = (settings.tradingStartTime || '09:15').split(':').map(Number);
+      const [cutoffH, cutoffM] = (settings.intradayCutoffTime || '15:15').split(':').map(Number);
+      const startTimeNum = startH * 100 + startM;
+      const cutoffTimeNum = cutoffH * 100 + cutoffM;
 
-    // Weekend or explicit closed state
-    if (day === 0 || day === 6) {
-      return { approved: false, code: REJECTION_CODES.MARKET_CLOSED, reason: 'Market is closed on weekends.' };
-    }
+      // Weekend or explicit closed state
+      if (day === 0 || day === 6) {
+        return { approved: false, code: REJECTION_CODES.MARKET_CLOSED, reason: 'Market is closed on weekends.' };
+      }
 
-    if (currentTimeNum < startTimeNum) {
-      return { 
-        approved: false, 
-        code: REJECTION_CODES.TRADING_NOT_STARTED, 
-        reason: `Trading session opens at ${settings.tradingStartTime} IST.` 
-      };
-    }
+      if (currentTimeNum < startTimeNum) {
+        return { 
+          approved: false, 
+          code: REJECTION_CODES.TRADING_NOT_STARTED, 
+          reason: `Trading session opens at ${settings.tradingStartTime} IST.` 
+        };
+      }
 
-    if (currentTimeNum >= cutoffTimeNum) {
-      return { 
-        approved: false, 
-        code: REJECTION_CODES.CUTOFF_TIME_REACHED, 
-        reason: `Intraday cutoff reached (${settings.intradayCutoffTime} IST). No new positions permitted.` 
-      };
+      if (currentTimeNum >= cutoffTimeNum) {
+        return { 
+          approved: false, 
+          code: REJECTION_CODES.CUTOFF_TIME_REACHED, 
+          reason: `Intraday cutoff reached (${settings.intradayCutoffTime} IST). No new positions permitted.` 
+        };
+      }
     }
 
     // 3. Daily Loss Limit Check

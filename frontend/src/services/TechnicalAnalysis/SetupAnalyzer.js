@@ -10,7 +10,7 @@ import { CandlestickPatternDetector } from './CandlestickPatternDetector';
 
 export const SetupAnalyzer = {
   
-  analyze(symbol, data) {
+  analyze(symbol, data, marketContext = null) {
     if (!data || data.length === 0) return null;
 
     const currentPrice = data[data.length - 1].close;

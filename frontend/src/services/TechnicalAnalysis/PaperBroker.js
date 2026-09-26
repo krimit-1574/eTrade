@@ -26,10 +26,18 @@ export const POSITION_STATUS = {
   CLOSED: 'POSITION_CLOSED',
 };
 
+const DEFAULT_BROKER_CONFIG = {
+  initialCapital: 100000,
+  slippage: 0.0005,
+  commission: 20,
+  spread: 0.0002,
+};
+
 // ------- Helper: calculate simulated fill price -------
-function calculateFillPrice(requestedPrice, direction, config) {
-  const slippage = requestedPrice * (config.slippage || 0);
-  const halfSpread = requestedPrice * ((config.spread || 0) / 2);
+function calculateFillPrice(requestedPrice, direction, config = {}) {
+  const cfg = config || DEFAULT_BROKER_CONFIG;
+  const slippage = requestedPrice * (cfg.slippage || 0);
+  const halfSpread = requestedPrice * ((cfg.spread || 0) / 2);
 
   if (direction === 'LONG') {
     // Buying: we get filled slightly higher (worse for buyer)
@@ -88,8 +96,9 @@ export const PaperBroker = {
 
     // 3. Determine quantity
     let quantity = customQuantity && customQuantity > 0 ? customQuantity : calculateQuantity(account, entry);
-    const commission = account.config.commission || 0;
-    const fillPrice = parseFloat(calculateFillPrice(entry, direction, account.config).toFixed(2));
+    const config = account.config || DEFAULT_BROKER_CONFIG;
+    const commission = config.commission || 0;
+    const fillPrice = parseFloat(calculateFillPrice(entry, direction, config).toFixed(2));
 
     // If slippage slightly pushed totalCost over available cash, scale down quantity
     while (quantity > 1 && (fillPrice * quantity + commission) > account.availableCash) {
@@ -162,6 +171,7 @@ export const PaperBroker = {
     };
 
     account.activePosition = position;
+    if (!account.orderHistory) account.orderHistory = [];
     account.orderHistory.push(order);
 
     const dirLabel = direction === 'LONG' ? 'Bought' : 'Sold short';
@@ -446,8 +456,9 @@ export const PaperBroker = {
 
     const pos = account.activePosition;
     const direction = pos.direction;
-    const fillPrice = parseFloat(calculateFillPrice(currentPrice, direction === 'LONG' ? 'SHORT' : 'LONG', account.config).toFixed(2));
-    const commission = account.config.commission || 0;
+    const config = account.config || DEFAULT_BROKER_CONFIG;
+    const fillPrice = parseFloat(calculateFillPrice(currentPrice, direction === 'LONG' ? 'SHORT' : 'LONG', config).toFixed(2));
+    const commission = config.commission || 0;
 
     // Partial Exit Check
     if (partialQuantity && partialQuantity > 0 && partialQuantity < pos.quantity) {
@@ -457,13 +468,16 @@ export const PaperBroker = {
         : (pos.entryPrice - fillPrice) * exitQty;
       pnl -= commission;
 
-      account.realizedPnL += pnl;
-      account.dailyPnL += pnl;
+      account.realizedPnL = (account.realizedPnL || 0) + pnl;
+      account.dailyPnL = (account.dailyPnL || 0) + pnl;
 
       // Return released capital + profit/loss to available cash
       const releasedCapital = pos.entryPrice * exitQty;
       account.availableCash += (releasedCapital + pnl);
       pos.quantity -= exitQty;
+      if (pos.remainingQuantity !== undefined) {
+        pos.remainingQuantity = pos.quantity;
+      }
       account.usedCapital = pos.entryPrice * pos.quantity;
 
       if (!pos.partialExits) pos.partialExits = [];
@@ -498,8 +512,8 @@ export const PaperBroker = {
     }
     pnl -= commission;
 
-    account.realizedPnL += pnl;
-    account.dailyPnL += pnl;
+    account.realizedPnL = (account.realizedPnL || 0) + pnl;
+    account.dailyPnL = (account.dailyPnL || 0) + pnl;
     account.availableCash += account.usedCapital + pnl;
     account.usedCapital = 0;
     account.unrealizedPnL = 0;

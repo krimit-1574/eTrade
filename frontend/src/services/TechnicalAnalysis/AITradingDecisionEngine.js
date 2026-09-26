@@ -11,12 +11,36 @@ export const AITradingDecisionEngine = {
    * Evaluates the technical analysis and returns a structured trade decision.
    * @param {Object} analysis - The output from SetupAnalyzer
    * @param {number} currentPrice - The latest tick/candle close price
+   * @param {Object} [marketContext] - Optional market context from MarketContextService
    * @returns {Object} - Trade Decision Object
    */
-  evaluate(analysis, currentPrice) {
+  evaluate(analysis, currentPrice, marketContext = null) {
     if (!analysis || !currentPrice) return this._createWaitDecision("Insufficient data for analysis.");
 
-    // Select strategy based on the setup detected by the Technical Engine
+    // Market Context Invalidation Check (Part 10)
+    // If the broad market is in severe breakdown and we're looking at a long setup, warn
+    if (marketContext?.regime) {
+      const regime = marketContext.regime;
+      if (regime.bias === 'WAIT' && regime.regime === 'HIGH_VOLATILITY') {
+        // Don't outright block, but add invalidation note for high-volatility divergence
+        if (analysis.setup === 'potential_long_breakout' || analysis.setup === 'potential_short_breakdown') {
+          const decision = this._evaluateStrategy(analysis, currentPrice);
+          if (decision.decision !== 'WAIT') {
+            decision.invalidation = (decision.invalidation || '') +
+              ` ⚠ Market Context: ${regime.label} — elevated sectoral divergence detected. Proceed with caution.`;
+          }
+          return decision;
+        }
+      }
+    }
+
+    return this._evaluateStrategy(analysis, currentPrice);
+  },
+
+  /**
+   * Internal strategy dispatch based on detected setup type.
+   */
+  _evaluateStrategy(analysis, currentPrice) {
     switch (analysis.setup) {
       case "potential_long_breakout":
       case "potential_short_breakdown":
@@ -24,7 +48,6 @@ export const AITradingDecisionEngine = {
       
       case "long_pullback_setup":
       case "short_pullback_setup":
-        // For now, return WAIT until PullbackStrategy is fully implemented
         return this._createWaitDecision(
           "Pullback detected, but waiting for stronger confirmation.", 
           analysis.setup, 
@@ -57,3 +80,4 @@ export const AITradingDecisionEngine = {
     };
   }
 };
+

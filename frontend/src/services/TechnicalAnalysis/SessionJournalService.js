@@ -404,6 +404,8 @@ function buildSessionPayload(accountOrOptions, symbolArg, timelineEventsArg, dec
   return {
     id: sessionId,
     user_id: userId,
+    userId: userId,
+    user: userId,
     symbol: (symbol || '').toUpperCase().replace('.NS', ''),
     start_time: account.createdAt || now,
     end_time: now,

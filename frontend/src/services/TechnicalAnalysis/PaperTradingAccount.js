@@ -54,13 +54,17 @@ export const PaperTradingAccount = {
    */
   load(config) {
     try {
-      const stored = sessionStorage.getItem(STORAGE_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (!parsed.pendingOrders) parsed.pendingOrders = [];
-        // Merge config overrides but keep stored balances
-        if (config) parsed.config = { ...DEFAULT_CONFIG, ...config };
-        return parsed;
+      if (typeof sessionStorage !== 'undefined') {
+        const stored = sessionStorage.getItem(STORAGE_KEY);
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          if (!parsed.pendingOrders) parsed.pendingOrders = [];
+          if (!parsed.closedPositions) parsed.closedPositions = [];
+          if (!parsed.orderHistory) parsed.orderHistory = [];
+          // Merge config overrides but keep stored balances
+          if (config) parsed.config = { ...DEFAULT_CONFIG, ...config };
+          return parsed;
+        }
       }
     } catch (e) {
       console.warn('PaperTradingAccount: Failed to load from storage', e);
@@ -73,7 +77,9 @@ export const PaperTradingAccount = {
    */
   save(account) {
     try {
-      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(account));
+      if (typeof sessionStorage !== 'undefined') {
+        sessionStorage.setItem(STORAGE_KEY, JSON.stringify(account));
+      }
     } catch (e) {
       console.warn('PaperTradingAccount: Failed to save to storage', e);
     }

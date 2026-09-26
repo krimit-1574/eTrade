@@ -215,7 +215,7 @@ export default function AIIntradayWorkspace({ symbol, onBack }) {
   useEffect(() => {
     if (technicalAnalysis && stockInfo.price > 0 && isMounted.current) {
       try {
-        const decision = AITradingDecisionEngine.evaluate(technicalAnalysis, stockInfo.price);
+        const decision = AITradingDecisionEngine.evaluate(technicalAnalysis, stockInfo.price, marketContext);
         setTradeDecision(decision);
 
         // Update AI Status based on decision and state (Part 10 State Matrix)

@@ -1,4 +1,4 @@
-const API = '';
+const API = typeof window !== 'undefined' && window.location?.origin ? '' : 'http://localhost:8000';
 
 function formatError(detail) {
   if (!detail) return 'Request failed';
