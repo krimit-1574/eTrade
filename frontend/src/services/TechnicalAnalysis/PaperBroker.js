@@ -82,8 +82,27 @@ export const PaperBroker = {
       type: 'active' 
     });
 
-    // 2. Validate: no existing active position
-    if (account.activePosition) {
+    // 2. Validate: no duplicate position on same symbol, and check max positions
+    if (!account.activePositions) {
+      account.activePositions = account.activePosition ? [account.activePosition] : [];
+    }
+    const cleanSym = (symbol || '').toUpperCase().replace('.NS', '');
+    const config = account.config || DEFAULT_BROKER_CONFIG;
+    const maxSimultaneous = config.maxSimultaneousPositions !== undefined ? config.maxSimultaneousPositions : 1;
+
+    const existingPos = account.activePositions.find(p => p.symbol === cleanSym || p.symbol === symbol);
+    if (existingPos) {
+      events.push({ 
+        id: Date.now() + 1, 
+        time: now(), 
+        title: 'Order rejected', 
+        detail: `An active position for ${symbol} already exists. Close it first.`, 
+        type: 'error' 
+      });
+      return { account, order: null, position: existingPos, events };
+    }
+
+    if (account.activePositions.length >= maxSimultaneous) {
       events.push({ 
         id: Date.now() + 1, 
         time: now(), 
@@ -91,12 +110,11 @@ export const PaperBroker = {
         detail: 'An active position already exists. Close it first.', 
         type: 'error' 
       });
-      return { account, order: null, position: account.activePosition, events };
+      return { account, order: null, position: account.activePositions[0] || null, events };
     }
 
     // 3. Determine quantity
     let quantity = customQuantity && customQuantity > 0 ? customQuantity : calculateQuantity(account, entry);
-    const config = account.config || DEFAULT_BROKER_CONFIG;
     const commission = config.commission || 0;
     const fillPrice = parseFloat(calculateFillPrice(entry, direction, config).toFixed(2));
 
@@ -121,7 +139,7 @@ export const PaperBroker = {
     // 4. Create order
     const order = {
       id: `ORD_${Date.now()}`,
-      symbol,
+      symbol: cleanSym,
       direction,
       type: 'MARKET',
       requestedPrice: entry,
@@ -142,19 +160,18 @@ export const PaperBroker = {
       id: Date.now() + 3, 
       time: now(), 
       title: 'Paper order created', 
-      detail: `Market ${direction} order for ${quantity} shares.`, 
+      detail: `Market ${direction} order for ${quantity} shares of ${cleanSym}.`, 
       type: 'info' 
     });
 
     // 5. Update account balances
     const cost = fillPrice * quantity;
     account.availableCash -= (cost + commission);
-    account.usedCapital = cost;
 
     // 6. Create position
     const position = {
       id: `POS_${Date.now()}`,
-      symbol,
+      symbol: cleanSym,
       direction,
       quantity,
       entryPrice: fillPrice,
@@ -170,7 +187,9 @@ export const PaperBroker = {
       setup,
     };
 
-    account.activePosition = position;
+    account.activePositions.push(position);
+    account.activePosition = account.activePositions[0];
+    account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
     if (!account.orderHistory) account.orderHistory = [];
     account.orderHistory.push(order);
 
@@ -411,31 +430,43 @@ export const PaperBroker = {
   /**
    * Checks active position against Stop-Loss and Target levels.
    */
-  checkPositionExitTriggers(account, currentPrice, high, low) {
-    if (!account.activePosition) {
+  checkPositionExitTriggers(account, currentPrice, high, low, targetSymbol = null) {
+    if (!account.activePositions) {
+      account.activePositions = account.activePosition ? [account.activePosition] : [];
+    }
+
+    let pos = null;
+    if (targetSymbol) {
+      const cleanTarget = targetSymbol.toUpperCase().replace('.NS', '');
+      pos = account.activePositions.find(p => p.symbol === cleanTarget || p.symbol === targetSymbol);
+    }
+    if (!pos) {
+      pos = account.activePositions[0] || account.activePosition;
+    }
+
+    if (!pos) {
       return { account, closed: false, events: [] };
     }
 
-    const pos = account.activePosition;
     const candleHigh = high ?? currentPrice;
     const candleLow = low ?? currentPrice;
 
     if (pos.direction === 'LONG') {
       if (pos.stopLoss && candleLow <= pos.stopLoss) {
-        const result = this.closePosition(account, pos.stopLoss, 'Stop Loss Hit');
+        const result = this.closePosition(account, pos.stopLoss, 'Stop Loss Hit', null, pos.symbol);
         return { account: result.account, closed: true, events: result.events };
       }
       if (pos.target1 && candleHigh >= pos.target1) {
-        const result = this.closePosition(account, pos.target1, 'Target 1 Reached');
+        const result = this.closePosition(account, pos.target1, 'Target 1 Reached', null, pos.symbol);
         return { account: result.account, closed: true, events: result.events };
       }
     } else if (pos.direction === 'SHORT') {
       if (pos.stopLoss && candleHigh >= pos.stopLoss) {
-        const result = this.closePosition(account, pos.stopLoss, 'Stop Loss Hit');
+        const result = this.closePosition(account, pos.stopLoss, 'Stop Loss Hit', null, pos.symbol);
         return { account: result.account, closed: true, events: result.events };
       }
       if (pos.target1 && candleLow <= pos.target1) {
-        const result = this.closePosition(account, pos.target1, 'Target 1 Reached');
+        const result = this.closePosition(account, pos.target1, 'Target 1 Reached', null, pos.symbol);
         return { account: result.account, closed: true, events: result.events };
       }
     }
@@ -446,15 +477,36 @@ export const PaperBroker = {
   /**
    * Closes the active position (or a partial quantity) at the given market price.
    */
-  closePosition(account, currentPrice, reason = 'Manual exit', partialQuantity = null) {
+  closePosition(account, currentPrice, reason = 'Manual exit', partialQuantity = null, targetSymbol = null) {
     const events = [];
     const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
 
-    if (!account.activePosition) {
+    if (!account.activePositions) {
+      account.activePositions = account.activePosition ? [account.activePosition] : [];
+    }
+
+    let pos = null;
+    let posIndex = -1;
+
+    if (targetSymbol) {
+      const cleanTarget = targetSymbol.toUpperCase().replace('.NS', '');
+      posIndex = account.activePositions.findIndex(p => p.symbol === cleanTarget || p.symbol === targetSymbol);
+      if (posIndex >= 0) pos = account.activePositions[posIndex];
+    }
+
+    if (!pos) {
+      if (account.activePositions.length > 0) {
+        pos = account.activePositions[0];
+        posIndex = 0;
+      } else if (account.activePosition) {
+        pos = account.activePosition;
+      }
+    }
+
+    if (!pos) {
       return { account, events, closedFully: false };
     }
 
-    const pos = account.activePosition;
     const direction = pos.direction;
     const config = account.config || DEFAULT_BROKER_CONFIG;
     const fillPrice = parseFloat(calculateFillPrice(currentPrice, direction === 'LONG' ? 'SHORT' : 'LONG', config).toFixed(2));
@@ -478,7 +530,7 @@ export const PaperBroker = {
       if (pos.remainingQuantity !== undefined) {
         pos.remainingQuantity = pos.quantity;
       }
-      account.usedCapital = pos.entryPrice * pos.quantity;
+      account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
 
       if (!pos.partialExits) pos.partialExits = [];
       pos.partialExits.push({
@@ -514,9 +566,10 @@ export const PaperBroker = {
 
     account.realizedPnL = (account.realizedPnL || 0) + pnl;
     account.dailyPnL = (account.dailyPnL || 0) + pnl;
-    account.availableCash += account.usedCapital + pnl;
-    account.usedCapital = 0;
-    account.unrealizedPnL = 0;
+
+    // Return released capital + profit/loss to available cash
+    const releasedCapital = pos.entryPrice * pos.quantity;
+    account.availableCash += (releasedCapital + pnl);
 
     pos.status = POSITION_STATUS.CLOSED;
     pos.exitPrice = fillPrice;
@@ -524,8 +577,19 @@ export const PaperBroker = {
     pos.exitTime = new Date().toISOString();
     pos.exitReason = reason;
 
+    if (!account.closedPositions) account.closedPositions = [];
     account.closedPositions.push({ ...pos });
-    account.activePosition = null;
+
+    if (posIndex >= 0) {
+      account.activePositions.splice(posIndex, 1);
+    } else {
+      account.activePositions = account.activePositions.filter(p => p.id !== pos.id && p.symbol !== pos.symbol);
+    }
+
+    account.activePosition = account.activePositions[0] || null;
+    account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
+    account.unrealizedPnL = account.activePositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
+    account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
 
     const pnlStr = pnl >= 0 ? `+₹${pnl.toFixed(2)}` : `-₹${Math.abs(pnl).toFixed(2)}`;
     const dirLabel = direction === 'LONG' ? 'Sold' : 'Covered';
@@ -545,15 +609,27 @@ export const PaperBroker = {
    * Updates Stop-Loss price on the active position.
    * Enforces Rule 8: Stop must generally never be widened.
    */
-  updateStopLoss(account, newStopLoss, reason = 'Stop adjustment') {
+  updateStopLoss(account, newStopLoss, reason = 'Stop adjustment', targetSymbol = null) {
     const events = [];
     const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
 
-    if (!account.activePosition || !newStopLoss || newStopLoss <= 0) {
+    if (!account.activePositions) {
+      account.activePositions = account.activePosition ? [account.activePosition] : [];
+    }
+
+    let pos = null;
+    if (targetSymbol) {
+      const cleanTarget = targetSymbol.toUpperCase().replace('.NS', '');
+      pos = account.activePositions.find(p => p.symbol === cleanTarget || p.symbol === targetSymbol);
+    }
+    if (!pos) {
+      pos = account.activePositions[0] || account.activePosition;
+    }
+
+    if (!pos || !newStopLoss || newStopLoss <= 0) {
       return { account, updated: false, events };
     }
 
-    const pos = account.activePosition;
     const roundedSL = parseFloat(newStopLoss.toFixed(2));
 
     // Rule 8: Never widen stops

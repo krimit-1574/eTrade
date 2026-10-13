@@ -12,9 +12,18 @@ export default function IntradayOpportunityTable({
   error = null,
   onRefresh,
   onStartAI,
+  activeSessions = {},
 }) {
   const [searchTerm, setSearchTerm] = useState('');
   const [biasFilter, setBiasFilter] = useState('ALL');
+
+  const activeSymbols = React.useMemo(() => {
+    if (!activeSessions) return [];
+    if (Array.isArray(activeSessions)) {
+      return activeSessions.map(s => (typeof s === 'string' ? s : s.symbol || '').toUpperCase().replace('.NS', ''));
+    }
+    return Object.keys(activeSessions).map(s => s.toUpperCase().replace('.NS', ''));
+  }, [activeSessions]);
 
   const filteredOpportunities = opportunities.filter((item) => {
     const matchesSearch =
@@ -199,6 +208,7 @@ export default function IntradayOpportunityTable({
                 key={item.sym || item.rank}
                 item={item}
                 onStartAI={onStartAI}
+                isSessionActive={activeSymbols.includes((item.sym || '').toUpperCase().replace('.NS', ''))}
               />
             ))}
             {!isLoading && filteredOpportunities.length === 0 && (

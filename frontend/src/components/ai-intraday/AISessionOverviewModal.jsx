@@ -5,6 +5,7 @@ import {
   AlertTriangle, CheckCircle, XCircle, Minus
 } from 'lucide-react';
 import { SessionJournalService } from '../../services/TechnicalAnalysis/SessionJournalService';
+import TradeDetailsModal from './TradeDetailsModal';
 
 // ─── Mini Equity Curve (pure CSS bars, no library dependency) ─────
 function EquityCurveChart({ equityCurve }) {
@@ -44,7 +45,7 @@ function EquityCurveChart({ equityCurve }) {
 }
 
 // ─── Trade Row Component ──────────────────────────────────────────
-function TradeRow({ trade, index }) {
+function TradeRow({ trade, index, onViewDetails }) {
   const [expanded, setExpanded] = useState(false);
   const pnl = parseFloat(trade.realizedPnL || trade.pnl || 0);
   const isWin = pnl >= 0;
@@ -142,6 +143,32 @@ function TradeRow({ trade, index }) {
               )}
             </div>
           )}
+
+          {/* Dedicated View Chart Button */}
+          <div style={{ marginTop: '14px', display: 'flex', justifyContent: 'flex-end' }}>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                if (onViewDetails) onViewDetails(trade);
+              }}
+              style={{
+                background: 'rgba(0, 240, 255, 0.1)',
+                border: '1px solid rgba(0, 240, 255, 0.3)',
+                color: 'var(--neon-cyan)',
+                borderRadius: '8px',
+                padding: '6px 14px',
+                fontSize: '0.74rem',
+                fontWeight: '700',
+                cursor: 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+              }}
+            >
+              <BarChart2 size={13} />
+              View Chart & Trade Levels
+            </button>
+          </div>
         </div>
       )}
     </div>
@@ -229,6 +256,7 @@ function RetrospectiveCard({ trade, index }) {
 
 export default function AISessionOverviewModal({ isOpen, onClose, session }) {
   const [activeTab, setActiveTab] = useState('analytics');
+  const [selectedTradeForDetails, setSelectedTradeForDetails] = useState(null);
 
   const analytics = useMemo(() => {
     if (!session) return null;
@@ -476,7 +504,7 @@ export default function AISessionOverviewModal({ isOpen, onClose, session }) {
                 </div>
               ) : (
                 trades.map((trade, i) => (
-                  <TradeRow key={i} trade={trade} index={i} />
+                  <TradeRow key={i} trade={trade} index={i} onViewDetails={(t) => setSelectedTradeForDetails(t)} />
                 ))
               )}
             </div>
@@ -498,6 +526,16 @@ export default function AISessionOverviewModal({ isOpen, onClose, session }) {
           )}
         </div>
       </div>
+
+      {/* Visual Trade Level Breakdown Modal */}
+      {selectedTradeForDetails && (
+        <TradeDetailsModal
+          isOpen={!!selectedTradeForDetails}
+          onClose={() => setSelectedTradeForDetails(null)}
+          trade={selectedTradeForDetails}
+          candles={session?.candles || []}
+        />
+      )}
     </div>
   );
 }

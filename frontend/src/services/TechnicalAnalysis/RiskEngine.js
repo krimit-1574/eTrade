@@ -17,7 +17,8 @@ export const DEFAULT_RISK_SETTINGS = {
   maxRiskPerTradePct: 1.0,        // 1.0% maximum risk of account value per trade (e.g. ₹1,000)
   maxCapitalPerTradePct: 25.0,    // 25% maximum position capital allocation (e.g. ₹25,000)
   maxDailyLoss: 3000,             // ₹3,000 max daily loss (3% of account) before trading halts
-  maxSimultaneousPositions: 1,    // 1 concurrent position for dedicated intraday focus
+  maxSimultaneousPositions: 4,    // Max 4 concurrent positions for multi-stock AI intraday
+  maxTotalExposurePct: 80.0,      // Max 80% total account exposure across all active positions
 
   // Trade Frequency & Overtrading Protection
   maxTradesPerStock: 3,           // Max 3 trades per symbol per day
@@ -266,12 +267,22 @@ export const RiskEngine = {
       };
     }
 
-    // 4. Maximum Simultaneous Positions
-    if (account.activePosition) {
+    // 4. Maximum Simultaneous Positions & Duplicate Symbol Check
+    const activeList = account.activePositions || (account.activePosition ? [account.activePosition] : []);
+    const maxPositions = settings.maxSimultaneousPositions ?? 4;
+    if (activeList.length >= maxPositions) {
       return { 
         approved: false, 
         code: REJECTION_CODES.MAX_POSITIONS_REACHED, 
-        reason: `Max simultaneous positions (${settings.maxSimultaneousPositions}) already active.` 
+        reason: `Max simultaneous positions (${maxPositions}) already active.` 
+      };
+    }
+    const cleanSym = (stockInfo?.sym || '').toUpperCase().replace('.NS', '');
+    if (activeList.some(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanSym)) {
+      return {
+        approved: false,
+        code: REJECTION_CODES.MAX_POSITIONS_REACHED,
+        reason: `Active position already exists for ${cleanSym}.`
       };
     }
 
@@ -286,7 +297,6 @@ export const RiskEngine = {
     }
 
     // 6. Maximum Trades per Stock (Symbol Specific)
-    const cleanSym = (stockInfo?.sym || '').toUpperCase();
     const symbolTrades = (account.closedPositions || []).filter(p => p.symbol === cleanSym);
     if (symbolTrades.length >= settings.maxTradesPerStock) {
       return { 

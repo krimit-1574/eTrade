@@ -6,9 +6,11 @@ import IntradayOpportunityTable from '../components/ai-intraday/IntradayOpportun
 import AIIntradayWorkspace from '../components/ai-intraday/AIIntradayWorkspace';
 import AIPastSessionsList from '../components/ai-intraday/AIPastSessionsList';
 import AISessionOverviewModal from '../components/ai-intraday/AISessionOverviewModal';
+import MultiAIOverviewPanel from '../components/ai-intraday/MultiAIOverviewPanel';
 import { IntradayScanner } from '../services/IntradayScanner';
 import { MarketContextService } from '../services/TechnicalAnalysis/MarketContextService';
 import { PaperTradingAccount } from '../services/TechnicalAnalysis/PaperTradingAccount';
+import { useAISessionManager } from '../hooks/useAISessionManager';
 
 export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackToDashboard }) {
   const [aiState, setAiState] = useState('READY');
@@ -21,17 +23,38 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
   const [isFallback, setIsFallback] = useState(false);
   const [error, setError] = useState(null);
   const [selectedSession, setSelectedSession] = useState(null);
-  const [marketContext, setMarketContext] = useState(null);
   const [paperAccount, setPaperAccount] = useState(() => PaperTradingAccount.load());
 
-  // Fetch market context (NIFTY, BANK NIFTY, SENSEX)
+  // Multi-Session Manager Hook
+  const {
+    sessions,
+    account: managerAccount,
+    marketContext,
+    activeCount,
+    startSession,
+    stopSession,
+    stopAllSessions,
+    isSessionActive,
+  } = useAISessionManager();
+
+  // Sync paper account from manager when it updates
   useEffect(() => {
-    if (!activeSymbol) {
+    if (managerAccount) {
+      setPaperAccount(managerAccount);
+    }
+  }, [managerAccount]);
+
+  // Fetch market context (NIFTY, BANK NIFTY, SENSEX) — fallback if manager hasn't loaded it
+  const [localMarketContext, setLocalMarketContext] = useState(null);
+  useEffect(() => {
+    if (!activeSymbol && !marketContext) {
       MarketContextService.fetchMarketIndices()
-        .then(res => setMarketContext(res))
+        .then(res => setLocalMarketContext(res))
         .catch(err => console.warn('AIIntradayPage: market context fetch error:', err));
     }
-  }, [activeSymbol]);
+  }, [activeSymbol, marketContext]);
+
+  const displayMarketContext = marketContext || localMarketContext;
 
   const runScanner = useCallback(async (force = false) => {
     setIsLoading(true);
@@ -67,12 +90,42 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
     runScanner(true);
   };
 
-  // If activeSymbol is present, render the dedicated /ai-intraday/:symbol workspace view
+  // Start AI session via the session manager (multi-stock support)
+  const handleStartAI = useCallback((symbol) => {
+    startSession(symbol);
+    onStartAI(symbol);
+  }, [startSession, onStartAI]);
+
+  // Stop a specific session from the overview panel
+  const handleStopSessionFromOverview = useCallback(async (symbol) => {
+    const sessionData = await stopSession(symbol);
+    if (sessionData) {
+      setSelectedSession(sessionData);
+    }
+  }, [stopSession]);
+
+  // Stop all sessions
+  const handleStopAll = useCallback(async () => {
+    const results = await stopAllSessions();
+    // Show the last session's summary
+    if (results.length > 0) {
+      setSelectedSession(results[results.length - 1]);
+    }
+  }, [stopAllSessions]);
+
+  // View a specific session workspace
+  const handleViewSession = useCallback((symbol) => {
+    onStartAI(symbol);
+  }, [onStartAI]);
+
+  // If activeSymbol is present, render the dedicated workspace view
+  // The workspace now observes the background session via useAISession hook
   if (activeSymbol) {
     return (
       <AIIntradayWorkspace
         symbol={activeSymbol}
         onBack={onBackToDashboard}
+        onSelectSymbol={handleViewSession}
       />
     );
   }
@@ -84,10 +137,11 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
         aiState={aiState}
         onRefresh={handleRefresh}
         isRefreshing={isLoading}
+        activeSessionCount={activeCount}
       />
 
       {/* Market Context Ticker Bar (NIFTY 50, BANK NIFTY, SENSEX) */}
-      {marketContext?.indices && (
+      {displayMarketContext?.indices && (
         <div
           className="mb-16"
           style={{
@@ -101,7 +155,7 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
             flexWrap: 'wrap',
           }}
         >
-          {marketContext.indices.map((idx) => {
+          {displayMarketContext.indices.map((idx) => {
             const isUp = idx.changePct >= 0;
             return (
               <span
@@ -131,7 +185,7 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
           })}
 
           {/* Market Regime Badge */}
-          {marketContext.regime && (
+          {displayMarketContext.regime && (
             <span
               style={{
                 display: 'inline-flex',
@@ -146,13 +200,23 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
                 color: 'var(--text-secondary)',
                 marginLeft: 'auto',
               }}
-              title={marketContext.regime.description}
+              title={displayMarketContext.regime.description}
             >
-              🌐 Market: <strong style={{ color: 'var(--text-primary)' }}>{marketContext.regime.label}</strong>
+              🌐 Market: <strong style={{ color: 'var(--text-primary)' }}>{displayMarketContext.regime.label}</strong>
             </span>
           )}
         </div>
       )}
+
+      {/* Multi-AI Session Overview Panel (only visible when sessions are running) */}
+      <MultiAIOverviewPanel
+        sessions={sessions}
+        account={paperAccount}
+        activeCount={activeCount}
+        onViewSession={handleViewSession}
+        onStopSession={handleStopSessionFromOverview}
+        onStopAll={handleStopAll}
+      />
 
       {/* Top Overview Metrics (6 cards) */}
       <AIIntradayStats
@@ -161,7 +225,7 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
         paperBalance={paperAccount.accountValue || paperAccount.availableCash || 100000}
         todayPnL={paperAccount.dailyPnL || 0}
         todayTrades={(paperAccount.closedPositions?.length || 0) + (paperAccount.activePosition ? 1 : 0)}
-        activePositions={paperAccount.activePosition ? 1 : 0}
+        activePositions={activeCount}
         marketStatusNote={marketStatusNote}
         onAiStateChange={(newState) => setAiState(newState)}
       />
@@ -176,7 +240,8 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
         isFallback={isFallback}
         error={error}
         onRefresh={handleRefresh}
-        onStartAI={onStartAI}
+        onStartAI={handleStartAI}
+        activeSessions={sessions}
       />
 
       {/* Past AI Trading Sessions Journal */}
@@ -213,4 +278,3 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
     </div>
   );
 }
-

@@ -37,6 +37,7 @@ function createFreshAccount(config = {}) {
 
     // Position tracking
     activePosition: null,
+    activePositions: [],
     pendingOrders: [],
     closedPositions: [],
     orderHistory: [],
@@ -61,6 +62,9 @@ export const PaperTradingAccount = {
           if (!parsed.pendingOrders) parsed.pendingOrders = [];
           if (!parsed.closedPositions) parsed.closedPositions = [];
           if (!parsed.orderHistory) parsed.orderHistory = [];
+          if (!parsed.activePositions) {
+            parsed.activePositions = parsed.activePosition ? [parsed.activePosition] : [];
+          }
           // Merge config overrides but keep stored balances
           if (config) parsed.config = { ...DEFAULT_CONFIG, ...config };
           return parsed;
@@ -96,29 +100,60 @@ export const PaperTradingAccount = {
 
   /**
    * Updates unrealized P&L and account value based on current market price.
+   * Supports both updateMarketPrice(account, price) and updateMarketPrice(account, symbol, price).
    */
-  updateMarketPrice(account, currentPrice) {
-    if (!account.activePosition) {
+  updateMarketPrice(account, symbolOrPrice, priceIfSymbol) {
+    if (!account.activePositions || account.activePositions.length === 0) {
+      if (account.activePosition) {
+        account.activePositions = [account.activePosition];
+      } else {
+        account.activePositions = [];
+      }
+    } else if (account.activePosition && !account.activePositions.includes(account.activePosition)) {
+      account.activePositions = [account.activePosition, ...account.activePositions];
+    }
+
+    if (typeof symbolOrPrice === 'number') {
+      const currentPrice = symbolOrPrice;
+      if (account.activePosition) {
+        const pos = account.activePosition;
+        if (pos.direction === 'LONG') {
+          pos.unrealizedPnL = (currentPrice - pos.entryPrice) * pos.quantity;
+        } else {
+          pos.unrealizedPnL = (pos.entryPrice - currentPrice) * pos.quantity;
+        }
+        pos.currentPrice = currentPrice;
+        pos.pnlPct = pos.entryPrice > 0 ? ((pos.unrealizedPnL / (pos.entryPrice * pos.quantity)) * 100) : 0;
+        account.unrealizedPnL = pos.unrealizedPnL;
+        account.accountValue = account.availableCash + (account.usedCapital || 0) + account.unrealizedPnL;
+        return account;
+      }
+    } else if (typeof symbolOrPrice === 'string' && typeof priceIfSymbol === 'number') {
+      const cleanSym = symbolOrPrice.toUpperCase().replace('.NS', '');
+      const pos = account.activePositions.find(p => p.symbol === cleanSym);
+      if (pos) {
+        if (pos.direction === 'LONG') {
+          pos.unrealizedPnL = (priceIfSymbol - pos.entryPrice) * pos.quantity;
+        } else {
+          pos.unrealizedPnL = (pos.entryPrice - priceIfSymbol) * pos.quantity;
+        }
+        pos.currentPrice = priceIfSymbol;
+        pos.pnlPct = pos.entryPrice > 0 ? ((pos.unrealizedPnL / (pos.entryPrice * pos.quantity)) * 100) : 0;
+      }
+    }
+
+    if (account.activePositions.length === 0) {
       account.unrealizedPnL = 0;
-      account.accountValue = account.availableCash + account.realizedPnL;
+      account.usedCapital = 0;
+      account.accountValue = account.availableCash;
+      account.activePosition = null;
       return account;
     }
 
-    const pos = account.activePosition;
-    const qty = pos.quantity;
-    const entry = pos.entryPrice;
-
-    if (pos.direction === 'LONG') {
-      account.unrealizedPnL = (currentPrice - entry) * qty;
-    } else {
-      account.unrealizedPnL = (entry - currentPrice) * qty;
-    }
-
-    pos.currentPrice = currentPrice;
-    pos.unrealizedPnL = account.unrealizedPnL;
-    pos.pnlPct = entry > 0 ? ((account.unrealizedPnL / (entry * qty)) * 100) : 0;
-
+    account.unrealizedPnL = account.activePositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
+    account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
     account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
+    account.activePosition = account.activePositions[0] || null;
     return account;
   },
 

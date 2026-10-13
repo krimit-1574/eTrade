@@ -62,20 +62,22 @@ export const PositionManager = {
     const rMultiple = initialRiskDistance > 0 ? parseFloat((priceDiff / initialRiskDistance).toFixed(2)) : 0;
 
     // 2. Intraday Cutoff Time Guard (15:15 IST)
-    const now = new Date();
-    const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
-    const ist = new Date(utc + (3600000 * 5.5));
-    const [cutoffH, cutoffM] = (riskSettings?.intradayCutoffTime || '15:15').split(':').map(Number);
-    const currentNum = ist.getHours() * 100 + ist.getMinutes();
-    const cutoffNum = cutoffH * 100 + cutoffM;
+    if (!riskSettings?.bypassMarketHours && !riskSettings?.bypassCutoff) {
+      const now = new Date();
+      const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+      const ist = new Date(utc + (3600000 * 5.5));
+      const [cutoffH, cutoffM] = (riskSettings?.intradayCutoffTime || '15:15').split(':').map(Number);
+      const currentNum = ist.getHours() * 100 + ist.getMinutes();
+      const cutoffNum = cutoffH * 100 + cutoffM;
 
-    if (currentNum >= cutoffNum) {
-      return {
-        action: POSITION_DECISION.EXIT,
-        reason: `Intraday cutoff reached (${riskSettings?.intradayCutoffTime || '15:15'} IST). Square-off enforced.`,
-        markerType: 'FINAL EXIT',
-        rMultiple,
-      };
+      if (currentNum >= cutoffNum) {
+        return {
+          action: POSITION_DECISION.EXIT,
+          reason: `Intraday cutoff reached (${riskSettings?.intradayCutoffTime || '15:15'} IST). Square-off enforced.`,
+          markerType: 'FINAL EXIT',
+          rMultiple,
+        };
+      }
     }
 
     // 3. Stop-Loss Breach Check

@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { 
-  ArrowLeft, StopCircle, RefreshCw, AlertCircle, 
+import {
+  ArrowLeft, StopCircle, RefreshCw, AlertCircle,
   TrendingUp, TrendingDown, Clock, ShieldCheck, Activity, BarChart2,
-  FileText, Award
+  FileText, Award, Minimize2, LayoutGrid, Monitor
 } from 'lucide-react';
 import { api } from '../../api';
 import AIStatusBadge from './AIStatusBadge';
@@ -12,6 +12,8 @@ import AIIntradayAnalysisPanel from './AIIntradayAnalysisPanel';
 import AIIntradayPositionPanel from './AIIntradayPositionPanel';
 import AIIntradayTradePlanPanel from './AIIntradayTradePlanPanel';
 import AIIntradayTimelinePanel from './AIIntradayTimelinePanel';
+import MultiStockWorkspaceGrid from './MultiStockWorkspaceGrid';
+import { useAISessionManager, useAISession } from '../../hooks/useAISessionManager';
 import { SetupAnalyzer } from '../../services/TechnicalAnalysis/SetupAnalyzer';
 import { AITradingDecisionEngine } from '../../services/TechnicalAnalysis/AITradingDecisionEngine';
 import { StrategyConfig } from '../../services/TechnicalAnalysis/StrategyConfig';
@@ -38,7 +40,7 @@ function getIndianMarketState() {
   // Convert to IST (UTC + 5:30)
   const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
   const istTime = new Date(utc + (3600000 * 5.5));
-  
+
   const day = istTime.getDay(); // 0 = Sun, 6 = Sat
   const hours = istTime.getHours();
   const minutes = istTime.getMinutes();
@@ -63,9 +65,14 @@ function getIndianMarketState() {
   return { status: 'MARKET CLOSED', color: 'var(--red)', isLive: false, note: 'Regular Session Closed (09:15-15:30 IST)' };
 }
 
-export default function AIIntradayWorkspace({ symbol, onBack }) {
+export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) {
   const cleanSymbol = (symbol || 'RELIANCE').toUpperCase();
   const formattedSymbol = cleanSymbol.includes('.') ? cleanSymbol : `${cleanSymbol}.NS`;
+
+  // Multi-session hooks and view state
+  const { sessions, activeCount, startSession, stopSession: stopSessionInManager } = useAISessionManager();
+  const { session: activeSessionState } = useAISession(cleanSymbol);
+  const [viewMode, setViewMode] = useState('FOCUS'); // 'FOCUS' or 'MULTI_GRID'
 
   const marketState = getIndianMarketState();
 
@@ -301,47 +308,47 @@ export default function AIIntradayWorkspace({ symbol, onBack }) {
             return;
           }
 
-        // Approved: Execute with Risk-Engine calculated position sizing
-        const { account: updatedAccount, events: orderEvents } = PaperBroker.executeMarketOrder(paperAccount, {
-          symbol: stockInfo.sym,
-          direction: decision.direction,
-          entry: decision.entry,
-          stopLoss: decision.stopLoss,
-          target1: decision.target1,
-          target2: decision.target2,
-          setup: decision.setup,
-          confidence: decision.confidence,
-          customQuantity: validation.quantity,
-        });
+          // Approved: Execute with Risk-Engine calculated position sizing
+          const { account: updatedAccount, events: orderEvents } = PaperBroker.executeMarketOrder(paperAccount, {
+            symbol: stockInfo.sym,
+            direction: decision.direction,
+            entry: decision.entry,
+            stopLoss: decision.stopLoss,
+            target1: decision.target1,
+            target2: decision.target2,
+            setup: decision.setup,
+            confidence: decision.confidence,
+            customQuantity: validation.quantity,
+          });
 
-        // Record initial BUY/SHORT entry marker on chart
-        const latestCandle = chartData[chartData.length - 1];
-        const candleTime = latestCandle?.time || latestCandle?.date;
-        if (candleTime && updatedAccount.activePosition) {
-          setSessionMarkers(prev => [...prev, {
-            time: candleTime,
-            position: decision.direction === 'LONG' ? 'belowBar' : 'aboveBar',
-            color: decision.direction === 'LONG' ? '#10B981' : '#EF4444',
-            shape: decision.direction === 'LONG' ? 'arrowUp' : 'arrowDown',
-            text: `${decision.direction === 'LONG' ? 'BUY' : 'SHORT'} @ ₹${updatedAccount.activePosition.entryPrice}`,
-          }]);
+          // Record initial BUY/SHORT entry marker on chart
+          const latestCandle = chartData[chartData.length - 1];
+          const candleTime = latestCandle?.time || latestCandle?.date;
+          if (candleTime && updatedAccount.activePosition) {
+            setSessionMarkers(prev => [...prev, {
+              time: candleTime,
+              position: decision.direction === 'LONG' ? 'belowBar' : 'aboveBar',
+              color: decision.direction === 'LONG' ? '#10B981' : '#EF4444',
+              shape: decision.direction === 'LONG' ? 'arrowUp' : 'arrowDown',
+              text: `${decision.direction === 'LONG' ? 'BUY' : 'SHORT'} @ ₹${updatedAccount.activePosition.entryPrice}`,
+            }]);
+          }
+
+          setPaperAccount({ ...updatedAccount });
+          setTimelineEvents(prev => [...prev, ...orderEvents]);
+          setAiStatus('POSITION OPEN');
         }
 
-        setPaperAccount({ ...updatedAccount });
-        setTimelineEvents(prev => [...prev, ...orderEvents]);
-        setAiStatus('POSITION OPEN');
+        // Reset execution flag when decision goes back to WAIT
+        if (decision.decision === 'WAIT') {
+          hasExecutedRef.current = false;
+        }
+      } catch (err) {
+        console.error('Workspace: DecisionEngine evaluate error:', err);
+        setAiStatus('WAITING');
       }
-
-      // Reset execution flag when decision goes back to WAIT
-      if (decision.decision === 'WAIT') {
-        hasExecutedRef.current = false;
-      }
-    } catch (err) {
-      console.error('Workspace: DecisionEngine evaluate error:', err);
-      setAiStatus('WAITING');
     }
-  }
-}, [technicalAnalysis, stockInfo.price, riskSettings, error, chartData, isStaleData, paperAccount.activePosition]);
+  }, [technicalAnalysis, stockInfo.price, riskSettings, error, chartData, isStaleData, paperAccount.activePosition]);
 
   // Autonomous Position Lifecycle & Order Evaluation on each price tick / candle
   useEffect(() => {
@@ -521,8 +528,8 @@ export default function AIIntradayWorkspace({ symbol, onBack }) {
     // If active paper position exists, close it immediately before stopping
     if (paperAccount.activePosition && stockInfo.price > 0) {
       const { account: closedAccount, events } = PaperBroker.closePosition(
-        paperAccount, 
-        stockInfo.price, 
+        paperAccount,
+        stockInfo.price,
         'AI session manually stopped by user.'
       );
       PaperTradingAccount.save(closedAccount);
@@ -576,345 +583,507 @@ export default function AIIntradayWorkspace({ symbol, onBack }) {
         </div>
       </div>
 
-      {/* Main Stock Header Card */}
-      <div className="card card-accent-gold mb-20" style={{ padding: '20px 24px' }}>
-        <div className="flex-between" style={{ flexWrap: 'wrap', gap: '16px' }}>
-          {/* Left: Symbol, Name, Badges */}
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-              <h1 style={{ fontSize: '2rem', fontWeight: '800', margin: 0, letterSpacing: '-0.5px' }}>
-                {stockInfo.sym}
-              </h1>
-              
-              {/* Actual Market State Badge (OPEN / CLOSED / PRE-MARKET) */}
-              <span
-                style={{
-                  fontSize: '0.72rem',
-                  fontWeight: '800',
-                  padding: '4px 10px',
-                  borderRadius: '12px',
-                  background: marketState.status === 'MARKET OPEN' ? 'rgba(16, 185, 129, 0.12)' : 'rgba(239, 68, 68, 0.12)',
-                  border: `1px solid ${marketState.status === 'MARKET OPEN' ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
-                  color: marketState.color,
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '6px',
-                  letterSpacing: '0.5px',
-                  textTransform: 'uppercase',
-                }}
-                title={marketState.note}
-              >
-                <span
-                  style={{
-                    width: '6px',
-                    height: '6px',
-                    borderRadius: '50%',
-                    background: marketState.color,
-                    boxShadow: `0 0 6px ${marketState.color}`,
-                  }}
-                />
-                {marketState.status}
-              </span>
-
-              {/* PAPER TRADING Badge */}
-              <span
-                style={{
-                  fontSize: '0.7rem',
-                  fontWeight: '800',
-                  padding: '4px 10px',
-                  borderRadius: '12px',
-                  background: 'rgba(245, 158, 11, 0.12)',
-                  border: '1px solid rgba(245, 158, 11, 0.35)',
-                  color: '#F59E0B',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '5px',
-                  letterSpacing: '0.5px',
-                }}
-              >
-                📝 PAPER TRADING
-              </span>
-
-              {/* Sector Benchmark Badge */}
-              <span
-                style={{
-                  fontSize: '0.7rem',
-                  fontWeight: '700',
-                  padding: '4px 10px',
-                  borderRadius: '12px',
-                  background: 'rgba(99, 102, 241, 0.12)',
-                  border: '1px solid rgba(99, 102, 241, 0.3)',
-                  color: '#818CF8',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '4px',
-                }}
-                title={`Sector Index: ${sectorInfo.name}`}
-              >
-                📊 {sectorInfo.name}
-              </span>
-
-              {/* General Market Regime Badge */}
-              {marketContext?.regime && (
-                <span
-                  style={{
-                    fontSize: '0.7rem',
-                    fontWeight: '700',
-                    padding: '4px 10px',
-                    borderRadius: '12px',
-                    background: 'rgba(255, 255, 255, 0.05)',
-                    border: '1px solid var(--border)',
-                    color: 'var(--text-secondary)',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '4px',
-                  }}
-                  title={`Benchmark Context: ${marketContext.regime.description}`}
-                >
-                  🌐 MKT: {marketContext.regime.label}
-                </span>
-              )}
-
-              <AIBiasBadge bias={tradeDecision ? (tradeDecision.direction === 'LONG' ? 'LONG' : (tradeDecision.direction === 'SHORT' ? 'SHORT' : 'WAIT')) : 'WAIT'} size="md" />
-              <AIStatusBadge state={aiStatus} size="md" />
-              
-              {/* Data Stream Connection Badge */}
-              <span
-                style={{
-                  fontSize: '0.7rem',
-                  fontWeight: '700',
-                  padding: '3px 10px',
-                  borderRadius: '12px',
-                  background: isStaleData ? 'rgba(239, 68, 68, 0.1)' : 'rgba(255, 255, 255, 0.05)',
-                  border: `1px solid ${isStaleData ? 'rgba(239, 68, 68, 0.3)' : 'var(--border)'}`,
-                  color: isStaleData ? '#EF4444' : 'var(--text-secondary)',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '4px',
-                }}
-              >
-                <Activity size={12} style={{ color: isStaleData ? '#EF4444' : 'var(--green)' }} /> 
-                {isStaleData ? 'STREAM STALE' : 'FEED CONNECTED'}
-              </span>
-            </div>
-            <p style={{ fontSize: '0.88rem', color: 'var(--text-secondary)', marginTop: '4px' }}>
-              {stockInfo.name} • High-Frequency Intraday AI Trading Room
-            </p>
-          </div>
-
-          {/* Right: Live Price & STOP AI Action */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
-            <div style={{ textAlign: 'right' }}>
-              <div style={{ fontSize: '1.85rem', fontWeight: '800', color: 'var(--text-primary)' }}>
-                {stockInfo.price > 0
-                  ? `₹${stockInfo.price.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`
-                  : 'Fetching Price...'}
-              </div>
-              <div
-                style={{
-                  color: isPositive ? 'var(--green)' : 'var(--red)',
-                  fontWeight: '700',
-                  fontSize: '0.9rem',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'flex-end',
-                  gap: '4px',
-                }}
-              >
-                {isPositive ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
-                {isPositive ? '+' : ''}{stockInfo.change.toFixed(2)} ({isPositive ? '+' : ''}{stockInfo.changePct.toFixed(2)}%)
-              </div>
-            </div>
-
-            {/* Actions: Session Report & STOP AI */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <button
-                className="btn btn-ghost"
-                onClick={handleOpenSessionModal}
-                style={{
-                  padding: '9px 14px',
-                  fontSize: '0.82rem',
-                  fontWeight: '700',
-                  letterSpacing: '0.3px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '6px',
-                  border: '1px solid rgba(255, 255, 255, 0.15)',
-                  background: 'rgba(255, 255, 255, 0.05)',
-                  color: 'var(--text-primary)',
-                }}
-                title="View session analytics, trade journal, and retrospective"
-              >
-                <FileText size={15} color="var(--neon-gold, #F59E0B)" />
-                <span>Session Report</span>
-              </button>
-
-              <button
-                className="btn btn-danger"
-                onClick={handleStopAI}
-                style={{
-                  padding: '10px 18px',
-                  fontSize: '0.85rem',
-                  fontWeight: '800',
-                  letterSpacing: '0.5px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '8px',
-                }}
-                title="Stop AI monitoring, save session journal, and exit"
-              >
-                <StopCircle size={18} />
-                <span>STOP AI</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Stale Data / Disconnect Warning Banner with Reconnect Action */}
-      {(isStaleData || error) && (
+      {/* Multi-Stock Session Tabs Bar — shows all active AI sessions */}
+      {activeCount > 1 && (
         <div
           className="mb-16"
           style={{
-            padding: '12px 18px',
-            background: 'rgba(239, 68, 68, 0.12)',
-            border: '1px solid rgba(239, 68, 68, 0.35)',
-            borderRadius: 'var(--radius-sm)',
             display: 'flex',
             alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: '12px',
-            fontSize: '0.84rem',
-            color: '#EF4444',
+            gap: '8px',
+            padding: '8px 12px',
+            borderRadius: 'var(--radius-sm)',
+            background: 'rgba(255, 255, 255, 0.02)',
+            border: '1px solid rgba(255, 255, 255, 0.06)',
+            flexWrap: 'wrap',
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <AlertCircle size={18} />
-            <span>
-              <strong>Data Warning:</strong> Live price/candle stream is disconnected or stale. New trade entries paused. Risk protections remain active.
-            </span>
+          {/* Stock Tabs */}
+          {Object.values(sessions)
+            .filter(s => s.isActive)
+            .map((s) => {
+              const isCurrentTab = s.symbol === cleanSymbol;
+              const tabPnl = s.positionSummary?.unrealizedPnL || 0;
+              const tabChangePct = s.changePct || 0;
+              const tabIsUp = tabChangePct >= 0;
+              return (
+                <button
+                  key={s.symbol}
+                  onClick={() => onSelectSymbol && onSelectSymbol(s.symbol)}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '7px 14px',
+                    borderRadius: '8px',
+                    background: isCurrentTab ? 'rgba(0, 240, 255, 0.08)' : 'rgba(255, 255, 255, 0.03)',
+                    border: isCurrentTab ? '1px solid rgba(0, 240, 255, 0.35)' : '1px solid rgba(255, 255, 255, 0.08)',
+                    color: isCurrentTab ? '#00F0FF' : 'var(--text-secondary)',
+                    cursor: 'pointer',
+                    fontSize: '0.78rem',
+                    fontWeight: isCurrentTab ? '800' : '600',
+                    transition: 'all 0.2s',
+                    letterSpacing: '0.3px',
+                  }}
+                  title={`Switch to ${s.symbol} workspace`}
+                >
+                  {/* Session status dot */}
+                  <span
+                    style={{
+                      width: '6px',
+                      height: '6px',
+                      borderRadius: '50%',
+                      background: s.hasPosition ? '#F59E0B' : (s.status === 'RUNNING' ? '#10B981' : '#64748B'),
+                      boxShadow: s.hasPosition ? '0 0 6px #F59E0B' : 'none',
+                    }}
+                  />
+                  <span style={{ fontWeight: '800' }}>{s.symbol}</span>
+                  <span style={{ color: tabIsUp ? '#10B981' : '#EF4444', fontSize: '0.7rem' }}>
+                    {tabIsUp ? '+' : ''}{tabChangePct.toFixed(1)}%
+                  </span>
+                  {s.hasPosition && tabPnl !== 0 && (
+                    <span style={{
+                      fontSize: '0.68rem',
+                      fontWeight: '700',
+                      padding: '1px 6px',
+                      borderRadius: '4px',
+                      background: tabPnl >= 0 ? 'rgba(16, 185, 129, 0.12)' : 'rgba(239, 68, 68, 0.12)',
+                      color: tabPnl >= 0 ? '#10B981' : '#EF4444',
+                    }}>
+                      {tabPnl >= 0 ? '+' : ''}₹{tabPnl.toFixed(0)}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+
+          {/* Spacer */}
+          <div style={{ flex: 1 }} />
+
+          {/* View Mode Toggle (Focus / Grid) */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px', padding: '3px' }}>
+            <button
+              onClick={() => setViewMode('FOCUS')}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+                padding: '5px 10px',
+                borderRadius: '6px',
+                background: viewMode === 'FOCUS' ? 'rgba(0, 240, 255, 0.12)' : 'transparent',
+                border: viewMode === 'FOCUS' ? '1px solid rgba(0, 240, 255, 0.25)' : '1px solid transparent',
+                color: viewMode === 'FOCUS' ? '#00F0FF' : 'var(--text-muted)',
+                cursor: 'pointer',
+                fontSize: '0.72rem',
+                fontWeight: '700',
+                transition: 'all 0.2s',
+              }}
+              title="Focus on single stock workspace"
+            >
+              <Monitor size={13} /> Focus
+            </button>
+            <button
+              onClick={() => setViewMode('MULTI_GRID')}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+                padding: '5px 10px',
+                borderRadius: '6px',
+                background: viewMode === 'MULTI_GRID' ? 'rgba(0, 240, 255, 0.12)' : 'transparent',
+                border: viewMode === 'MULTI_GRID' ? '1px solid rgba(0, 240, 255, 0.25)' : '1px solid transparent',
+                color: viewMode === 'MULTI_GRID' ? '#00F0FF' : 'var(--text-muted)',
+                cursor: 'pointer',
+                fontSize: '0.72rem',
+                fontWeight: '700',
+                transition: 'all 0.2s',
+              }}
+              title="Multi-stock split-screen grid"
+            >
+              <LayoutGrid size={13} /> Grid ({activeCount})
+            </button>
           </div>
-          <button
-            className="btn btn-sm btn-ghost"
-            onClick={() => {
-              fetchLiveQuote();
-              fetchCandleData(timeframe, true);
-            }}
-            disabled={isRefreshing}
-            style={{ border: '1px solid rgba(239, 68, 68, 0.4)', color: '#EF4444', display: 'flex', alignItems: 'center', gap: '6px' }}
-          >
-            <RefreshCw size={13} className={isRefreshing ? 'spin-anim' : ''} />
-            <span>{isRefreshing ? 'Reconnecting...' : 'Reconnect'}</span>
-          </button>
         </div>
       )}
 
-      {/* Intraday Risk Management Monitor Strip */}
-      <AIIntradayRiskBar
-        account={paperAccount}
-        riskSettings={riskSettings}
-        calculatedSizing={useMemo(() => {
-          if (tradeDecision && tradeDecision.decision !== 'WAIT' && tradeDecision.entry && tradeDecision.stopLoss) {
-            return RiskEngine.calculatePositionSize({
-              accountValue: paperAccount.accountValue,
-              availableCash: paperAccount.availableCash,
-              entryPrice: tradeDecision.entry,
-              stopLoss: tradeDecision.stopLoss,
-              settings: riskSettings,
-            });
-          }
-          return null;
-        }, [tradeDecision, paperAccount.accountValue, paperAccount.availableCash, riskSettings])}
-        onOpenSettings={() => setIsRiskModalOpen(true)}
-      />
-
-      {/* Candlestick Chart */}
-      <div className="mb-24">
-        <AIIntradayChart
-          data={chartData}
-          isLoading={isChartLoading}
-          activeTimeframe={timeframe}
-          onTimeframeChange={handleTimeframeChange}
-          markers={[...sessionMarkers, ...chartMarkers]}
-          tradeLevels={tradeLevels}
+      {/* Multi-Stock Grid View (replaces single-stock focus when toggled) */}
+      {viewMode === 'MULTI_GRID' && activeCount > 1 ? (
+        <MultiStockWorkspaceGrid
+          sessions={sessions}
+          onExpandSession={(sym) => {
+            setViewMode('FOCUS');
+            if (onSelectSymbol) onSelectSymbol(sym);
+          }}
+          onStopSession={async (sym) => {
+            await stopSessionInManager(sym);
+          }}
+          onMinimizeSession={() => { }}
         />
-      </div>
+      ) : (
+        <>
+          {/* Main Stock Header Card */}
+          <div className="card card-accent-gold mb-20" style={{ padding: '20px 24px' }}>
+            <div className="flex-between" style={{ flexWrap: 'wrap', gap: '16px' }}>
+              {/* Left: Symbol, Name, Badges */}
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                  <h1 style={{ fontSize: '2rem', fontWeight: '800', margin: 0, letterSpacing: '-0.5px' }}>
+                    {stockInfo.sym}
+                  </h1>
 
-      {/* 4 Bottom Panels in Grid Layout */}
-      <div className="grid-2 mb-24" style={{ gap: '20px' }}>
-        {/* Panel 1: AI Trade Analysis */}
-        <AIIntradayAnalysisPanel
-          stockData={stockInfo}
-          aiStatus={aiStatus}
-          bias={technicalAnalysis ? (technicalAnalysis.setupStrength >= 60 ? 'LONG' : (technicalAnalysis.setupStrength <= 40 ? 'SHORT' : 'WAIT')) : 'WAIT'}
-          aiScore={technicalAnalysis ? technicalAnalysis.setupStrength : 50}
-          aiConfidence={technicalAnalysis ? Math.min(99, Math.max(45, technicalAnalysis.setupStrength + 10)) : 50}
-          analysisData={technicalAnalysis}
-        />
+                  {/* Actual Market State Badge (OPEN / CLOSED / PRE-MARKET) */}
+                  <span
+                    style={{
+                      fontSize: '0.72rem',
+                      fontWeight: '800',
+                      padding: '4px 10px',
+                      borderRadius: '12px',
+                      background: marketState.status === 'MARKET OPEN' ? 'rgba(16, 185, 129, 0.12)' : 'rgba(239, 68, 68, 0.12)',
+                      border: `1px solid ${marketState.status === 'MARKET OPEN' ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
+                      color: marketState.color,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      letterSpacing: '0.5px',
+                      textTransform: 'uppercase',
+                    }}
+                    title={marketState.note}
+                  >
+                    <span
+                      style={{
+                        width: '6px',
+                        height: '6px',
+                        borderRadius: '50%',
+                        background: marketState.color,
+                        boxShadow: `0 0 6px ${marketState.color}`,
+                      }}
+                    />
+                    {marketState.status}
+                  </span>
 
-        {/* Panel 2: Current Position */}
-        <AIIntradayPositionPanel
-          position={paperAccount.activePosition}
-          account={paperAccount}
-          onClosePosition={handleClosePosition}
-        />
+                  {/* PAPER TRADING Badge */}
+                  <span
+                    style={{
+                      fontSize: '0.7rem',
+                      fontWeight: '800',
+                      padding: '4px 10px',
+                      borderRadius: '12px',
+                      background: 'rgba(245, 158, 11, 0.12)',
+                      border: '1px solid rgba(245, 158, 11, 0.35)',
+                      color: '#F59E0B',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '5px',
+                      letterSpacing: '0.5px',
+                    }}
+                  >
+                    📝 PAPER TRADING
+                  </span>
 
-        {/* Panel 3: Trade Plan */}
-        <AIIntradayTradePlanPanel tradeDecision={tradeDecision} />
+                  {/* Sector Benchmark Badge */}
+                  <span
+                    style={{
+                      fontSize: '0.7rem',
+                      fontWeight: '700',
+                      padding: '4px 10px',
+                      borderRadius: '12px',
+                      background: 'rgba(99, 102, 241, 0.12)',
+                      border: '1px solid rgba(99, 102, 241, 0.3)',
+                      color: '#818CF8',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                    }}
+                    title={`Sector Index: ${sectorInfo.name}`}
+                  >
+                    📊 {sectorInfo.name}
+                  </span>
 
-        {/* Panel 4: Trade Timeline */}
-        <AIIntradayTimelinePanel
-          symbol={stockInfo.sym}
-          sessionTime={sessionStartTime}
-          events={timelineEvents}
-        />
-      </div>
+                  {/* General Market Regime Badge */}
+                  {marketContext?.regime && (
+                    <span
+                      style={{
+                        fontSize: '0.7rem',
+                        fontWeight: '700',
+                        padding: '4px 10px',
+                        borderRadius: '12px',
+                        background: 'rgba(255, 255, 255, 0.05)',
+                        border: '1px solid var(--border)',
+                        color: 'var(--text-secondary)',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                      }}
+                      title={`Benchmark Context: ${marketContext.regime.description}`}
+                    >
+                      🌐 MKT: {marketContext.regime.label}
+                    </span>
+                  )}
 
-      {/* Risk Engine Settings Modal */}
-      <AIIntradayRiskSettingsModal
-        isOpen={isRiskModalOpen}
-        onClose={() => setIsRiskModalOpen(false)}
-        currentSettings={riskSettings}
-        onSave={(newSettings) => {
-          const saved = RiskEngine.saveSettings(newSettings);
-          setRiskSettings(saved);
-        }}
-        onReset={() => {
-          const defaults = RiskEngine.resetSettings();
-          setRiskSettings(defaults);
-        }}
-      />
+                  <AIBiasBadge bias={tradeDecision ? (tradeDecision.direction === 'LONG' ? 'LONG' : (tradeDecision.direction === 'SHORT' ? 'SHORT' : 'WAIT')) : 'WAIT'} size="md" />
+                  <AIStatusBadge state={aiStatus} size="md" />
 
-      {/* Session Overview / Journal Modal (Part 9) */}
-      <AISessionOverviewModal
-        isOpen={isSessionModalOpen}
-        onClose={() => {
-          setIsSessionModalOpen(false);
-          if (aiStatus === 'STOPPED' && onBack) {
-            onBack();
-          }
-        }}
-        session={currentSessionData}
-      />
+                  {/* Data Stream Connection Badge */}
+                  <span
+                    style={{
+                      fontSize: '0.7rem',
+                      fontWeight: '700',
+                      padding: '3px 10px',
+                      borderRadius: '12px',
+                      background: isStaleData ? 'rgba(239, 68, 68, 0.1)' : 'rgba(255, 255, 255, 0.05)',
+                      border: `1px solid ${isStaleData ? 'rgba(239, 68, 68, 0.3)' : 'var(--border)'}`,
+                      color: isStaleData ? '#EF4444' : 'var(--text-secondary)',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                    }}
+                  >
+                    <Activity size={12} style={{ color: isStaleData ? '#EF4444' : 'var(--green)' }} />
+                    {isStaleData ? 'STREAM STALE' : 'FEED CONNECTED'}
+                  </span>
+                </div>
+                <p style={{ fontSize: '0.88rem', color: 'var(--text-secondary)', marginTop: '4px' }}>
+                  {stockInfo.name} • High-Frequency Intraday AI Trading Room
+                </p>
+              </div>
 
-      {/* Mandatory AI Intraday Paper Trading Disclaimer (Part 10) */}
-      <div style={{
-        marginTop: '24px',
-        padding: '12px 18px',
-        borderRadius: '8px',
-        background: 'rgba(255, 255, 255, 0.02)',
-        border: '1px solid rgba(255, 255, 255, 0.06)',
-        display: 'flex',
-        alignItems: 'center',
-        gap: '10px',
-        fontSize: '0.74rem',
-        color: 'var(--text-muted)',
-      }}>
-        <AlertCircle size={15} color="#F59E0B" style={{ flexShrink: 0 }} />
-        <span>
-          <strong>Paper Trading Disclaimer:</strong> AI-generated trading decisions are experimental and intended for paper trading/testing. Trading strategies can generate losses and past performance does not guarantee future results.
-        </span>
-      </div>
+              {/* Right: Live Price & STOP AI Action */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+                <div style={{ textAlign: 'right' }}>
+                  <div style={{ fontSize: '1.85rem', fontWeight: '800', color: 'var(--text-primary)' }}>
+                    {stockInfo.price > 0
+                      ? `₹${stockInfo.price.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`
+                      : 'Fetching Price...'}
+                  </div>
+                  <div
+                    style={{
+                      color: isPositive ? 'var(--green)' : 'var(--red)',
+                      fontWeight: '700',
+                      fontSize: '0.9rem',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'flex-end',
+                      gap: '4px',
+                    }}
+                  >
+                    {isPositive ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
+                    {isPositive ? '+' : ''}{stockInfo.change.toFixed(2)} ({isPositive ? '+' : ''}{stockInfo.changePct.toFixed(2)}%)
+                  </div>
+                </div>
+
+                {/* Actions: Minimize, Session Report & STOP AI */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <button
+                    className="btn btn-ghost"
+                    onClick={onBack}
+                    style={{
+                      padding: '9px 14px',
+                      fontSize: '0.82rem',
+                      fontWeight: '700',
+                      letterSpacing: '0.3px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      border: '1px solid rgba(255, 255, 255, 0.15)',
+                      background: 'rgba(255, 255, 255, 0.05)',
+                      color: 'var(--text-secondary)',
+                    }}
+                    title="Minimize workspace — AI session continues running in background"
+                  >
+                    <Minimize2 size={15} />
+                    <span>Minimize</span>
+                  </button>
+
+                  <button
+                    className="btn btn-ghost"
+                    onClick={handleOpenSessionModal}
+                    style={{
+                      padding: '9px 14px',
+                      fontSize: '0.82rem',
+                      fontWeight: '700',
+                      letterSpacing: '0.3px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      border: '1px solid rgba(255, 255, 255, 0.15)',
+                      background: 'rgba(255, 255, 255, 0.05)',
+                      color: 'var(--text-primary)',
+                    }}
+                    title="View session analytics, trade journal, and retrospective"
+                  >
+                    <FileText size={15} color="var(--neon-gold, #F59E0B)" />
+                    <span>Session Report</span>
+                  </button>
+
+                  <button
+                    className="btn btn-danger"
+                    onClick={handleStopAI}
+                    style={{
+                      padding: '10px 18px',
+                      fontSize: '0.85rem',
+                      fontWeight: '800',
+                      letterSpacing: '0.5px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '8px',
+                    }}
+                    title="Stop AI monitoring, save session journal, and exit"
+                  >
+                    <StopCircle size={18} />
+                    <span>STOP AI</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Stale Data / Disconnect Warning Banner with Reconnect Action */}
+          {(isStaleData || error) && (
+            <div
+              className="mb-16"
+              style={{
+                padding: '12px 18px',
+                background: 'rgba(239, 68, 68, 0.12)',
+                border: '1px solid rgba(239, 68, 68, 0.35)',
+                borderRadius: 'var(--radius-sm)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '12px',
+                fontSize: '0.84rem',
+                color: '#EF4444',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <AlertCircle size={18} />
+                <span>
+                  <strong>Data Warning:</strong> Live price/candle stream is disconnected or stale. New trade entries paused. Risk protections remain active.
+                </span>
+              </div>
+              <button
+                className="btn btn-sm btn-ghost"
+                onClick={() => {
+                  fetchLiveQuote();
+                  fetchCandleData(timeframe, true);
+                }}
+                disabled={isRefreshing}
+                style={{ border: '1px solid rgba(239, 68, 68, 0.4)', color: '#EF4444', display: 'flex', alignItems: 'center', gap: '6px' }}
+              >
+                <RefreshCw size={13} className={isRefreshing ? 'spin-anim' : ''} />
+                <span>{isRefreshing ? 'Reconnecting...' : 'Reconnect'}</span>
+              </button>
+            </div>
+          )}
+
+          {/* Intraday Risk Management Monitor Strip */}
+          <AIIntradayRiskBar
+            account={paperAccount}
+            riskSettings={riskSettings}
+            calculatedSizing={useMemo(() => {
+              if (tradeDecision && tradeDecision.decision !== 'WAIT' && tradeDecision.entry && tradeDecision.stopLoss) {
+                return RiskEngine.calculatePositionSize({
+                  accountValue: paperAccount.accountValue,
+                  availableCash: paperAccount.availableCash,
+                  entryPrice: tradeDecision.entry,
+                  stopLoss: tradeDecision.stopLoss,
+                  settings: riskSettings,
+                });
+              }
+              return null;
+            }, [tradeDecision, paperAccount.accountValue, paperAccount.availableCash, riskSettings])}
+            onOpenSettings={() => setIsRiskModalOpen(true)}
+          />
+
+          {/* Candlestick Chart */}
+          <div className="mb-24">
+            <AIIntradayChart
+              data={chartData}
+              isLoading={isChartLoading}
+              activeTimeframe={timeframe}
+              onTimeframeChange={handleTimeframeChange}
+              markers={[...sessionMarkers, ...chartMarkers]}
+              tradeLevels={tradeLevels}
+            />
+          </div>
+
+          {/* 4 Bottom Panels in Grid Layout */}
+          <div className="grid-2 mb-24" style={{ gap: '20px' }}>
+            {/* Panel 1: AI Trade Analysis */}
+            <AIIntradayAnalysisPanel
+              stockData={stockInfo}
+              aiStatus={aiStatus}
+              bias={technicalAnalysis ? (technicalAnalysis.setupStrength >= 60 ? 'LONG' : (technicalAnalysis.setupStrength <= 40 ? 'SHORT' : 'WAIT')) : 'WAIT'}
+              aiScore={technicalAnalysis ? technicalAnalysis.setupStrength : 50}
+              aiConfidence={technicalAnalysis ? Math.min(99, Math.max(45, technicalAnalysis.setupStrength + 10)) : 50}
+              analysisData={technicalAnalysis}
+            />
+
+            {/* Panel 2: Current Position */}
+            <AIIntradayPositionPanel
+              position={paperAccount.activePosition}
+              account={paperAccount}
+              onClosePosition={handleClosePosition}
+            />
+
+            {/* Panel 3: Trade Plan */}
+            <AIIntradayTradePlanPanel tradeDecision={tradeDecision} />
+
+            {/* Panel 4: Trade Timeline */}
+            <AIIntradayTimelinePanel
+              symbol={stockInfo.sym}
+              sessionTime={sessionStartTime}
+              events={timelineEvents}
+            />
+          </div>
+
+          {/* Risk Engine Settings Modal */}
+          <AIIntradayRiskSettingsModal
+            isOpen={isRiskModalOpen}
+            onClose={() => setIsRiskModalOpen(false)}
+            currentSettings={riskSettings}
+            onSave={(newSettings) => {
+              const saved = RiskEngine.saveSettings(newSettings);
+              setRiskSettings(saved);
+            }}
+            onReset={() => {
+              const defaults = RiskEngine.resetSettings();
+              setRiskSettings(defaults);
+            }}
+          />
+
+          {/* Session Overview / Journal Modal (Part 9) */}
+          <AISessionOverviewModal
+            isOpen={isSessionModalOpen}
+            onClose={() => {
+              setIsSessionModalOpen(false);
+              if (aiStatus === 'STOPPED' && onBack) {
+                onBack();
+              }
+            }}
+            session={currentSessionData}
+          />
+
+          {/* Mandatory AI Intraday Paper Trading Disclaimer (Part 10) */}
+          <div style={{
+            marginTop: '24px',
+            padding: '12px 18px',
+            borderRadius: '8px',
+            background: 'rgba(255, 255, 255, 0.02)',
+            border: '1px solid rgba(255, 255, 255, 0.06)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '10px',
+            fontSize: '0.74rem',
+            color: 'var(--text-muted)',
+          }}>
+            <AlertCircle size={15} color="#F59E0B" style={{ flexShrink: 0 }} />
+            <span>
+              <strong>Paper Trading Disclaimer:</strong> AI-generated trading decisions are experimental and intended for paper trading/testing. Trading strategies can generate losses and past performance does not guarantee future results.
+            </span>
+          </div>
+        </>
+      )}
     </div>
   );
 }
+

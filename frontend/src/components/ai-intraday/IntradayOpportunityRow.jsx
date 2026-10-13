@@ -1,8 +1,8 @@
 import React from 'react';
-import { Play, ArrowUpRight, ArrowDownRight } from 'lucide-react';
+import { Play, ArrowUpRight, ArrowDownRight, Eye } from 'lucide-react';
 import AIBiasBadge from './AIBiasBadge';
 
-export default function IntradayOpportunityRow({ item, onStartAI }) {
+export default function IntradayOpportunityRow({ item, onStartAI, isSessionActive = false }) {
   const price = item.price || 0;
   const changePct = item.changePct || 0;
   const isPositive = changePct >= 0;
@@ -121,16 +121,45 @@ export default function IntradayOpportunityRow({ item, onStartAI }) {
         <AIBiasBadge bias={item.bias} size="sm" />
       </td>
 
-      {/* 14. Start AI Button */}
+      {/* 14. Start AI / View AI Button */}
       <td className="cell-action">
-        <button
-          className="btn btn-primary btn-sm start-ai-btn"
-          onClick={() => onStartAI && onStartAI(item.sym)}
-          title={`Start AI workspace for ${item.sym}`}
-        >
-          <Play size={12} fill="currentColor" />
-          START AI
-        </button>
+        {isSessionActive ? (
+          <button
+            className="btn btn-sm"
+            onClick={() => onStartAI && onStartAI(item.sym)}
+            title={`View active AI workspace for ${item.sym}`}
+            style={{
+              background: 'rgba(16, 185, 129, 0.15)',
+              border: '1px solid rgba(16, 185, 129, 0.4)',
+              color: '#10B981',
+              fontWeight: '700',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px',
+              padding: '6px 12px',
+              fontSize: '0.74rem',
+            }}
+          >
+            <span style={{
+              width: '6px',
+              height: '6px',
+              borderRadius: '50%',
+              background: '#10B981',
+              boxShadow: '0 0 6px #10B981',
+            }} />
+            <Eye size={12} />
+            VIEW AI
+          </button>
+        ) : (
+          <button
+            className="btn btn-primary btn-sm start-ai-btn"
+            onClick={() => onStartAI && onStartAI(item.sym)}
+            title={`Start AI workspace for ${item.sym}`}
+          >
+            <Play size={12} fill="currentColor" />
+            START AI
+          </button>
+        )}
       </td>
     </tr>
   );
