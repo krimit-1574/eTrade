@@ -9,35 +9,24 @@
  * ⚠️ PAPER TRADING ONLY.
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { AISessionManager } from '../services/TechnicalAnalysis/AISessionManager';
 import { PaperTradingAccount } from '../services/TechnicalAnalysis/PaperTradingAccount';
 import { RiskEngine } from '../services/TechnicalAnalysis/RiskEngine';
-
-let isManagerInitialized = false;
 
 /**
  * Hook: Subscribe to the full AISessionManager state.
  * Returns a snapshot that updates whenever the manager notifies.
  */
-export function useAISessionManager() {
-  const [snapshot, setSnapshot] = useState(() => ({
-    sessions: AISessionManager.sessions ? Object.fromEntries(
-      [...AISessionManager.sessions.entries()].map(([k, s]) => [k, { ...s }])
-    ) : {},
-    account: AISessionManager.account || null,
-    marketContext: AISessionManager.marketContext || null,
-    activeCount: AISessionManager.getActiveSessions ? AISessionManager.getActiveSessions().length : 0,
-  }));
+export function useAISessionManager(userId) {
+  const [snapshot, setSnapshot] = useState(() => AISessionManager.getSnapshot());
 
   useEffect(() => {
-    // Initialize the manager on first use only once across all hook mounts
-    if (!isManagerInitialized) {
-      isManagerInitialized = true;
-      const account = PaperTradingAccount.load();
-      const riskSettings = RiskEngine.loadSettings();
-      AISessionManager.initialize(account, riskSettings);
-    }
+    // initialize() is idempotent and also handles authenticated-user changes.
+    // Avoid a module-level flag, which became stale after destroy()/logout.
+    const account = PaperTradingAccount.load();
+    const riskSettings = RiskEngine.loadSettings();
+    AISessionManager.initialize(account, riskSettings, userId);
 
     // Subscribe to state changes
     const unsubscribe = AISessionManager.subscribe((newSnapshot) => {
@@ -47,7 +36,7 @@ export function useAISessionManager() {
     return () => {
       unsubscribe();
     };
-  }, []);
+  }, [userId]);
 
   const startSession = useCallback((symbol, config) => {
     return AISessionManager.startSession(symbol, config);
@@ -106,10 +95,10 @@ export function useAISessionManager() {
 /**
  * Hook: Subscribe to a single session's state by symbol.
  */
-export function useAISession(symbol) {
-  const { snapshot, stopSession, manualClosePosition, changeTimeframe, refreshSession } = useAISessionManager();
+export function useAISession(symbol, userId) {
+  const { snapshot, stopSession, manualClosePosition, changeTimeframe, refreshSession } = useAISessionManager(userId);
 
-  const cleanSymbol = (symbol || '').toUpperCase().replace('.NS', '');
+  const cleanSymbol = String(symbol || '').trim().toUpperCase().replace(/\.NS$/, '');
   const session = snapshot.sessions?.[cleanSymbol] || null;
 
   return {

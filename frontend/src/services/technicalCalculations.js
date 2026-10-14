@@ -4,7 +4,8 @@
  */
 
 export function calculateEMA(data, period) {
-  if (!data || data.length < period) return [];
+  if (!Array.isArray(data) || !Number.isInteger(period) || period <= 0 || data.length < period) return [];
+  if (data.some((candle) => !Number.isFinite(Number(candle?.close)))) return [];
 
   const k = 2 / (period + 1);
   const emaData = [];
@@ -12,7 +13,7 @@ export function calculateEMA(data, period) {
   // Initial SMA as starting point for EMA
   let sum = 0;
   for (let i = 0; i < period; i++) {
-    sum += data[i].close;
+    sum += Number(data[i].close);
   }
   let prevEMA = sum / period;
 
@@ -22,7 +23,7 @@ export function calculateEMA(data, period) {
   });
 
   for (let i = period; i < data.length; i++) {
-    const currentClose = data[i].close;
+    const currentClose = Number(data[i].close);
     const currentEMA = (currentClose - prevEMA) * k + prevEMA;
     emaData.push({
       time: data[i].time,
@@ -35,7 +36,7 @@ export function calculateEMA(data, period) {
 }
 
 export function calculateIntradayVWAP(data) {
-  if (!data || data.length === 0) return [];
+  if (!Array.isArray(data) || data.length === 0) return [];
 
   const vwapData = [];
   let cumTypicalVolume = 0;
@@ -45,7 +46,8 @@ export function calculateIntradayVWAP(data) {
   for (let i = 0; i < data.length; i++) {
     const candle = data[i];
     const timestamp = typeof candle.time === 'number' ? candle.time * 1000 : new Date(candle.time).getTime();
-    const candleDay = new Date(timestamp).toDateString();
+    if (!Number.isFinite(timestamp)) continue;
+    const candleDay = new Date(timestamp).toISOString().slice(0, 10);
 
     // Reset cumulative sums on new trading day
     if (currentDay !== candleDay) {
@@ -54,14 +56,18 @@ export function calculateIntradayVWAP(data) {
       cumVolume = 0;
     }
 
-    const high = candle.high;
-    const low = candle.low;
-    const close = candle.close;
-    const vol = candle.volume || 1;
+    const high = Number(candle.high);
+    const low = Number(candle.low);
+    const close = Number(candle.close);
+    const parsedVolume = Number(candle.volume);
+    if (![high, low, close].every(Number.isFinite)) continue;
+    const vol = Number.isFinite(parsedVolume) && parsedVolume > 0 ? parsedVolume : 0;
     const typicalPrice = (high + low + close) / 3;
 
-    cumTypicalVolume += typicalPrice * vol;
-    cumVolume += vol;
+    if (vol > 0) {
+      cumTypicalVolume += typicalPrice * vol;
+      cumVolume += vol;
+    }
 
     const vwap = cumVolume > 0 ? cumTypicalVolume / cumVolume : close;
 
@@ -75,7 +81,7 @@ export function calculateIntradayVWAP(data) {
 }
 
 export function calculateKeyLevels(data) {
-  if (!data || data.length === 0) {
+  if (!Array.isArray(data) || data.length === 0) {
     return {
       dayHigh: null,
       dayLow: null,
@@ -89,9 +95,12 @@ export function calculateKeyLevels(data) {
   const dayGroups = {};
   for (const candle of data) {
     const ts = typeof candle.time === 'number' ? candle.time * 1000 : new Date(candle.time).getTime();
+    const high = Number(candle?.high);
+    const low = Number(candle?.low);
+    if (!Number.isFinite(ts) || !Number.isFinite(high) || !Number.isFinite(low)) continue;
     const dayStr = new Date(ts).toISOString().split('T')[0];
     if (!dayGroups[dayStr]) dayGroups[dayStr] = [];
-    dayGroups[dayStr].push(candle);
+    dayGroups[dayStr].push({ ...candle, high, low });
   }
 
   const sortedDays = Object.keys(dayGroups).sort();
@@ -113,9 +122,9 @@ export function calculateKeyLevels(data) {
   }
 
   return {
-    dayHigh: dayHigh ? parseFloat(dayHigh.toFixed(2)) : null,
-    dayLow: dayLow ? parseFloat(dayLow.toFixed(2)) : null,
-    prevDayHigh: prevDayHigh ? parseFloat(prevDayHigh.toFixed(2)) : null,
-    prevDayLow: prevDayLow ? parseFloat(prevDayLow.toFixed(2)) : null,
+    dayHigh: Number.isFinite(dayHigh) ? parseFloat(dayHigh.toFixed(2)) : null,
+    dayLow: Number.isFinite(dayLow) ? parseFloat(dayLow.toFixed(2)) : null,
+    prevDayHigh: Number.isFinite(prevDayHigh) ? parseFloat(prevDayHigh.toFixed(2)) : null,
+    prevDayLow: Number.isFinite(prevDayLow) ? parseFloat(prevDayLow.toFixed(2)) : null,
   };
 }

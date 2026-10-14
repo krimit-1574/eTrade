@@ -76,15 +76,20 @@ export default function MarketListPage({ user, marketType, assetType, onBack, on
   const key = `${marketType}-${assetType}`;
   const baseAssets = SEEDS[key] || SEEDS['india-stocks'];
 
+  const getDirectSymbol = (value) => {
+    const normalized = value.trim().toUpperCase();
+    if (marketType === 'india' && normalized && !normalized.includes('.')) {
+      return `${normalized}.NS`;
+    }
+    return normalized;
+  };
+
   // Handle live search when query is typed
   useEffect(() => {
-    if (!search.trim()) {
-      setSearchResults([]);
-      setSearching(false);
-      return;
-    }
+    if (!search.trim()) return undefined;
 
     setSearching(true);
+    let cancelled = false;
     const timer = setTimeout(async () => {
       try {
         const queryToSearch = marketType === 'india' && !search.includes('.') 
@@ -104,16 +109,19 @@ export default function MarketListPage({ user, marketType, assetType, onBack, on
           });
         }
 
-        setSearchResults(items);
+        if (!cancelled) setSearchResults(items);
       } catch (err) {
         console.error("Search failed:", err);
-        setSearchResults([]);
+        if (!cancelled) setSearchResults([]);
       } finally {
-        setSearching(false);
+        if (!cancelled) setSearching(false);
       }
     }, 350);
 
-    return () => clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [search, marketType]);
 
   // Determine displayed assets (search results or filtered seeds)
@@ -137,24 +145,34 @@ export default function MarketListPage({ user, marketType, assetType, onBack, on
   // Fetch live prices for top visible items
   useEffect(() => {
     const top = displayedAssets.slice(0, 15);
-    top.forEach(async (asset) => {
-      if (liveData[asset.sym]) return; // avoid duplicate fetch
+    let cancelled = false;
+
+    Promise.all(top.map(async (asset) => {
       try {
         const data = await api.getPrice(asset.sym);
-        if (data && data.price !== "N/A" && data.price !== null) {
-          setLiveData(prev => ({
-            ...prev,
-            [asset.sym]: {
-              price: parseFloat(data.price),
-              change: parseFloat(data.change),
-              pct: parseFloat(data.pct)
-            }
-          }));
-        }
-      } catch (err) {
-        // silent
+        const price = Number(data?.price);
+        if (!Number.isFinite(price) || price <= 0) return null;
+        const change = Number(data?.change);
+        const pct = Number(data?.pct);
+        return [asset.sym, {
+          price,
+          change: Number.isFinite(change) ? change : 0,
+          pct: Number.isFinite(pct) ? pct : 0,
+        }];
+      } catch {
+        return null;
+      }
+    })).then((entries) => {
+      if (cancelled) return;
+      const validEntries = entries.filter(Boolean);
+      if (validEntries.length > 0) {
+        setLiveData((previous) => ({ ...previous, ...Object.fromEntries(validEntries) }));
       }
     });
+
+    return () => {
+      cancelled = true;
+    };
   }, [displayedAssets]);
 
   let title = '';
@@ -181,7 +199,14 @@ export default function MarketListPage({ user, marketType, assetType, onBack, on
           className="input" 
           placeholder={marketType === 'india' ? "Search ANY stock of India (e.g. Zomato, Suzlon, Tata Motors, Reliance)..." : `Search ${title} by symbol or name...`}
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          onChange={(e) => {
+            const value = e.target.value;
+            setSearch(value);
+            if (!value.trim()) {
+              setSearchResults([]);
+              setSearching(false);
+            }
+          }}
           style={{ 
             paddingLeft: '40px', 
             background: 'var(--bg-card) url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'16\' height=\'16\' viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'%239CA3AF\' stroke-width=\'2\' stroke-linecap=\'round\' stroke-linejoin=\'round\'%3E%3Ccircle cx=\'11\' cy=\'11\' r=\'8\'%3E%3C/circle%3E%3Cline x1=\'21\' y1=\'21\' x2=\'16.65\' y2=\'16.65\'%3E%3C/line%3E%3C/svg%3E") no-repeat 12px center' 
@@ -205,7 +230,7 @@ export default function MarketListPage({ user, marketType, assetType, onBack, on
           </div>
           <button 
             className="btn btn-primary btn-sm"
-            onClick={() => onAnalyze(search.includes('.') ? search : `${search.toUpperCase()}.NS`)}
+            onClick={() => onAnalyze(getDirectSymbol(search))}
           >
             <Eye size={14} /> Analyze "{search.toUpperCase()}" Now
           </button>
@@ -282,7 +307,7 @@ export default function MarketListPage({ user, marketType, assetType, onBack, on
               <p style={{ color: 'var(--text-secondary)' }}>No cached matching assets found for "{search}".</p>
               <button 
                 className="btn btn-primary mt-16"
-                onClick={() => onAnalyze(search.includes('.') ? search : `${search.toUpperCase()}.NS`)}
+                onClick={() => onAnalyze(getDirectSymbol(search))}
               >
                 <Sparkles size={16} /> Run Full AI Analysis on "{search.toUpperCase()}"
               </button>

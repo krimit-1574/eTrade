@@ -33,18 +33,108 @@ const DEFAULT_BROKER_CONFIG = {
   spread: 0.0002,
 };
 
+let idSequence = 0;
+
+function finiteNumber(value, fallback = null) {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function positivePrice(value) {
+  const parsed = finiteNumber(value);
+  return parsed !== null && parsed > 0 ? parsed : null;
+}
+
+function normalizeSymbol(symbol) {
+  return typeof symbol === 'string'
+    ? symbol.trim().toUpperCase().replace(/\.NS$/i, '')
+    : '';
+}
+
+function normalizeDirection(direction) {
+  return direction === 'LONG' || direction === 'SHORT' ? direction : null;
+}
+
+function createId(prefix) {
+  idSequence = (idSequence + 1) % Number.MAX_SAFE_INTEGER;
+  return `${prefix}_${Date.now()}_${idSequence}`;
+}
+
+function getBrokerConfig(account) {
+  const raw = { ...DEFAULT_BROKER_CONFIG, ...(account?.config || {}) };
+  return {
+    ...raw,
+    initialCapital: Math.max(0, finiteNumber(raw.initialCapital, DEFAULT_BROKER_CONFIG.initialCapital)),
+    slippage: Math.max(0, finiteNumber(raw.slippage, DEFAULT_BROKER_CONFIG.slippage)),
+    commission: Math.max(0, finiteNumber(raw.commission, DEFAULT_BROKER_CONFIG.commission)),
+    spread: Math.max(0, finiteNumber(raw.spread, DEFAULT_BROKER_CONFIG.spread)),
+    maxSimultaneousPositions: Math.max(0, Math.floor(finiteNumber(raw.maxSimultaneousPositions, 1))),
+  };
+}
+
+function ensureAccountState(account) {
+  if (!account || typeof account !== 'object') return false;
+  if (!Array.isArray(account.activePositions)) account.activePositions = [];
+  if (account.activePositions.length === 0 && account.activePosition && account.activePosition.status !== POSITION_STATUS.CLOSED) {
+    account.activePositions.push(account.activePosition);
+  }
+  account.activePosition = account.activePositions[0] ?? null;
+  if (!Array.isArray(account.pendingOrders)) account.pendingOrders = [];
+  if (!Array.isArray(account.closedPositions)) account.closedPositions = [];
+  if (!Array.isArray(account.orderHistory)) account.orderHistory = [];
+  account.availableCash = Math.max(0, finiteNumber(account.availableCash, 0));
+  account.realizedPnL = finiteNumber(account.realizedPnL, 0);
+  account.dailyPnL = finiteNumber(account.dailyPnL, 0);
+  return true;
+}
+
+function recalculateAccount(account) {
+  ensureAccountState(account);
+  account.usedCapital = account.activePositions.reduce((sum, position) => {
+    const entryPrice = positivePrice(position?.entryPrice) || 0;
+    const quantity = Math.max(0, finiteNumber(position?.quantity, 0));
+    return sum + entryPrice * quantity;
+  }, 0);
+  account.unrealizedPnL = account.activePositions.reduce(
+    (sum, position) => sum + finiteNumber(position?.unrealizedPnL, 0),
+    0
+  );
+  account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
+  account.activePosition = account.activePositions[0] ?? null;
+}
+
+function syncOrderHistory(account, order) {
+  if (!Array.isArray(account.orderHistory)) account.orderHistory = [];
+  const index = account.orderHistory.findIndex(historyOrder => historyOrder.id === order.id);
+  if (index >= 0 && account.orderHistory[index] !== order) {
+    Object.assign(account.orderHistory[index], order);
+  }
+}
+
+function normalizeRequestedQuantity(value) {
+  const parsed = finiteNumber(value);
+  return parsed !== null && parsed > 0 ? Math.floor(parsed) : 0;
+}
+
+function normalizeOptionalPrice(value) {
+  if (value === null || value === undefined) return null;
+  return positivePrice(value);
+}
+
 // ------- Helper: calculate simulated fill price -------
 function calculateFillPrice(requestedPrice, direction, config = {}) {
-  const cfg = config || DEFAULT_BROKER_CONFIG;
-  const slippage = requestedPrice * (cfg.slippage || 0);
-  const halfSpread = requestedPrice * ((cfg.spread || 0) / 2);
+  const price = positivePrice(requestedPrice);
+  if (price === null || !normalizeDirection(direction)) return null;
+  const cfg = { ...DEFAULT_BROKER_CONFIG, ...(config || {}) };
+  const slippage = price * Math.max(0, finiteNumber(cfg.slippage, 0));
+  const halfSpread = price * (Math.max(0, finiteNumber(cfg.spread, 0)) / 2);
 
   if (direction === 'LONG') {
     // Buying: we get filled slightly higher (worse for buyer)
-    return requestedPrice + slippage + halfSpread;
+    return price + slippage + halfSpread;
   } else {
     // Shorting: we get filled slightly lower (worse for seller)
-    return requestedPrice - slippage - halfSpread;
+    return price - slippage - halfSpread;
   }
 }
 
@@ -52,14 +142,17 @@ function calculateFillPrice(requestedPrice, direction, config = {}) {
 // Deliberately separated from trading decisions.
 // Part 7 will replace this with a proper risk-based engine.
 function calculateQuantity(account, entryPrice) {
-  if (!entryPrice || entryPrice <= 0 || !account.availableCash || account.availableCash <= 0) return 0;
-  const bufferPrice = entryPrice * 1.01;
-  const maxAffordable = Math.floor((account.availableCash - (account.config?.commission || 20)) / bufferPrice);
+  const price = positivePrice(entryPrice);
+  const availableCash = finiteNumber(account?.availableCash, 0);
+  if (price === null || availableCash <= 0) return 0;
+  const config = getBrokerConfig(account);
+  const bufferPrice = price * (1 + config.slippage + (config.spread / 2));
+  const maxAffordable = Math.floor((availableCash - config.commission) / bufferPrice);
   if (maxAffordable < 1) return 0;
 
   // Conservative: risk 2% of available cash per trade
-  const riskCapital = account.availableCash * 0.02;
-  const qty = Math.floor(riskCapital / (entryPrice * 0.02));
+  const riskCapital = availableCash * 0.02;
+  const qty = Math.floor(riskCapital / (price * 0.02));
   return Math.max(1, Math.min(qty, maxAffordable));
 }
 
@@ -69,28 +162,47 @@ export const PaperBroker = {
    * Creates and immediately fills a MARKET order (simulated).
    * @returns {{ account, order, position, events }} 
    */
-  executeMarketOrder(account, { symbol, direction, entry, stopLoss, target1, target2, setup, confidence, customQuantity, sessionId }) {
+  executeMarketOrder(account, { symbol, direction, entry, stopLoss, target1, target2, setup, confidence, customQuantity, sessionId } = {}) {
     const events = [];
     const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
+
+    if (!ensureAccountState(account)) {
+      return { account, order: null, position: null, events };
+    }
+
+    const cleanSym = normalizeSymbol(symbol);
+    const normalizedDirection = normalizeDirection(direction);
+    const requestedEntry = positivePrice(entry);
+    const normalizedStop = normalizeOptionalPrice(stopLoss);
+    const normalizedTarget1 = normalizeOptionalPrice(target1);
+    const normalizedTarget2 = normalizeOptionalPrice(target2);
+    const invalidOptionalPrice = (value, normalized) => value !== null && value !== undefined && normalized === null;
+
+    if (!cleanSym || !normalizedDirection || requestedEntry === null ||
+        invalidOptionalPrice(stopLoss, normalizedStop) ||
+        invalidOptionalPrice(target1, normalizedTarget1) ||
+        invalidOptionalPrice(target2, normalizedTarget2) ||
+        (normalizedStop !== null && (normalizedDirection === 'LONG' ? normalizedStop >= requestedEntry : normalizedStop <= requestedEntry)) ||
+        (normalizedTarget1 !== null && (normalizedDirection === 'LONG' ? normalizedTarget1 <= requestedEntry : normalizedTarget1 >= requestedEntry)) ||
+        (normalizedTarget2 !== null && (normalizedDirection === 'LONG' ? normalizedTarget2 <= requestedEntry : normalizedTarget2 >= requestedEntry))) {
+      events.push({ id: Date.now(), time: now(), title: 'Order rejected', detail: 'Invalid symbol, direction, quantity, or trade prices.', type: 'error' });
+      return { account, order: null, position: null, events };
+    }
 
     // 1. Signal generated
     events.push({ 
       id: Date.now(), 
       time: now(), 
-      title: `${direction} signal generated`, 
+      title: `${normalizedDirection} signal generated`, 
       detail: `Setup: ${(setup || '').replace(/_/g, ' ')}. Confidence: ${confidence}%.`, 
       type: 'active' 
     });
 
     // 2. Validate: no duplicate position on same symbol, and check max positions
-    if (!account.activePositions) {
-      account.activePositions = account.activePosition ? [account.activePosition] : [];
-    }
-    const cleanSym = (symbol || '').toUpperCase().replace('.NS', '');
-    const config = account.config || DEFAULT_BROKER_CONFIG;
-    const maxSimultaneous = config.maxSimultaneousPositions !== undefined ? config.maxSimultaneousPositions : 1;
+    const config = getBrokerConfig(account);
+    const maxSimultaneous = config.maxSimultaneousPositions;
 
-    const existingPos = account.activePositions.find(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanSym || p.symbol === symbol);
+    const existingPos = account.activePositions.find(p => normalizeSymbol(p.symbol) === cleanSym);
     if (existingPos) {
       events.push({ 
         id: Date.now() + 1, 
@@ -100,6 +212,11 @@ export const PaperBroker = {
         type: 'error' 
       });
       return { account, order: null, position: existingPos, events };
+    }
+
+    if (account.pendingOrders.some(order => normalizeSymbol(order.symbol) === cleanSym)) {
+      events.push({ id: Date.now() + 1, time: now(), title: 'Order rejected', detail: `A pending order for ${cleanSym} already exists.`, type: 'error' });
+      return { account, order: null, position: null, events };
     }
 
     if (account.activePositions.length >= maxSimultaneous) {
@@ -114,9 +231,14 @@ export const PaperBroker = {
     }
 
     // 3. Determine quantity
-    let quantity = customQuantity && customQuantity > 0 ? customQuantity : calculateQuantity(account, entry);
-    const commission = config.commission || 0;
-    const fillPrice = parseFloat(calculateFillPrice(entry, direction, config).toFixed(2));
+    const hasCustomQuantity = customQuantity !== null && customQuantity !== undefined;
+    let quantity = hasCustomQuantity ? normalizeRequestedQuantity(customQuantity) : calculateQuantity(account, requestedEntry);
+    if (hasCustomQuantity && quantity <= 0) {
+      events.push({ id: Date.now() + 2, time: now(), title: 'Order rejected', detail: 'Quantity must be a positive whole number.', type: 'error' });
+      return { account, order: null, position: null, events };
+    }
+    const commission = config.commission;
+    const fillPrice = parseFloat(calculateFillPrice(requestedEntry, normalizedDirection, config).toFixed(2));
 
     // If slippage slightly pushed totalCost over available cash, scale down quantity
     while (quantity > 1 && (fillPrice * quantity + commission) > account.availableCash) {
@@ -138,20 +260,20 @@ export const PaperBroker = {
 
     // 4. Create order
     const order = {
-      id: `ORD_${Date.now()}`,
+      id: createId('ORD'),
       symbol: cleanSym,
-      direction,
+      direction: normalizedDirection,
       type: 'MARKET',
-      requestedPrice: entry,
+      requestedPrice: requestedEntry,
       fillPrice,
       quantity,
       commission,
       status: ORDER_STATUS.FILLED,
       setup,
       confidence,
-      stopLoss,
-      target1,
-      target2,
+      stopLoss: normalizedStop,
+      target1: normalizedTarget1,
+      target2: normalizedTarget2,
       sessionId: sessionId || null,
       createdAt: new Date().toISOString(),
       filledAt: new Date().toISOString(),
@@ -161,25 +283,31 @@ export const PaperBroker = {
       id: Date.now() + 3, 
       time: now(), 
       title: 'Paper order created', 
-      detail: `Market ${direction} order for ${quantity} shares of ${cleanSym}.`, 
+      detail: `Market ${normalizedDirection} order for ${quantity} shares of ${cleanSym}.`, 
       type: 'info' 
     });
 
     // 5. Update account balances
     const cost = fillPrice * quantity;
     account.availableCash -= (cost + commission);
+    account.realizedPnL -= commission;
+    account.dailyPnL -= commission;
 
     // 6. Create position
     const position = {
-      id: `POS_${Date.now()}`,
+      id: createId('POS'),
       symbol: cleanSym,
-      direction,
+      direction: normalizedDirection,
       quantity,
       entryPrice: fillPrice,
       currentPrice: fillPrice,
-      stopLoss: stopLoss ? parseFloat(stopLoss.toFixed(2)) : null,
-      target1: target1 ? parseFloat(target1.toFixed(2)) : null,
-      target2: target2 ? parseFloat(target2.toFixed(2)) : null,
+      stopLoss: normalizedStop !== null ? parseFloat(normalizedStop.toFixed(2)) : null,
+      initialStopLoss: normalizedStop !== null ? parseFloat(normalizedStop.toFixed(2)) : null,
+      target1: normalizedTarget1 !== null ? parseFloat(normalizedTarget1.toFixed(2)) : null,
+      target2: normalizedTarget2 !== null ? parseFloat(normalizedTarget2.toFixed(2)) : null,
+      remainingQuantity: quantity,
+      entryCommission: commission,
+      realizedPnL: -commission,
       unrealizedPnL: 0,
       pnlPct: 0,
       status: POSITION_STATUS.OPEN,
@@ -190,14 +318,10 @@ export const PaperBroker = {
     };
 
     account.activePositions.push(position);
-    account.activePosition = account.activePositions[0] ?? null;
-    account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
-    account.unrealizedPnL = account.activePositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
-    account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
-    if (!account.orderHistory) account.orderHistory = [];
+    recalculateAccount(account);
     account.orderHistory.push(order);
 
-    const dirLabel = direction === 'LONG' ? 'Bought' : 'Sold short';
+    const dirLabel = normalizedDirection === 'LONG' ? 'Bought' : 'Sold short';
     events.push({ 
       id: Date.now() + 4, 
       time: now(), 

@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useState, useEffect, useCallback } from 'react';
+import { motion as Motion, AnimatePresence } from 'framer-motion';
 import { Plus, X, Eye, Bell, RefreshCw } from 'lucide-react';
 import { api } from '../api';
 
@@ -10,29 +10,47 @@ export default function WatchlistPage({ user }) {
   const [error, setError] = useState('');
   const [livePrices, setLivePrices] = useState({});
   const [refreshing, setRefreshing] = useState(false);
+  const isGuest = user?.user_id === 'guest';
 
-  const fetchWatchlist = async () => {
-    if (user.user_id === 'guest') return;
+  const fetchWatchlist = useCallback(async () => {
+    if (!user?.user_id || isGuest) return;
     try {
       const res = await api.getWatchlist(user.user_id);
-      setWatchlist(res);
-    } catch { /* ignore */ }
-  };
+      setWatchlist(Array.isArray(res) ? res : []);
+    } catch (err) {
+      setError(err.message || 'Failed to load watchlist.');
+    }
+  }, [isGuest, user?.user_id]);
 
-  useEffect(() => { fetchWatchlist(); }, []);
+  useEffect(() => { void fetchWatchlist(); }, [fetchWatchlist]);
 
   const handleAdd = async (e) => {
     e.preventDefault();
     setError('');
+    if (isGuest) {
+      setError('Please sign in to manage a watchlist.');
+      return;
+    }
     if (!form.name || !form.symbol || !form.alert_price) {
       setError('Please fill in all fields.');
       return;
     }
+    const alertPrice = Number(form.alert_price);
+    if (!Number.isFinite(alertPrice) || alertPrice <= 0) {
+      setError('Alert price must be a positive number.');
+      return;
+    }
     try {
-      await api.addWatchlist(user.user_id, form.name, form.symbol, parseFloat(form.alert_price), form.alert_dir);
+      await api.addWatchlist(
+        user.user_id,
+        form.name.trim(),
+        form.symbol.trim().toUpperCase(),
+        alertPrice,
+        form.alert_dir,
+      );
       setForm({ name: '', symbol: '', alert_price: '', alert_dir: 'below' });
       setShowForm(false);
-      fetchWatchlist();
+      await fetchWatchlist();
     } catch (err) {
       setError(err.message);
     }
@@ -41,21 +59,29 @@ export default function WatchlistPage({ user }) {
   const handleRemove = async (wid) => {
     try {
       await api.removeWatchlist(wid, user.user_id);
-      fetchWatchlist();
-    } catch { /* ignore */ }
+      await fetchWatchlist();
+    } catch (err) {
+      setError(err.message || 'Failed to remove watchlist item.');
+    }
   };
 
   const refreshPrices = async () => {
     setRefreshing(true);
-    const prices = {};
-    for (const w of watchlist) {
-      try {
-        const p = await api.getPrice(w.symbol);
-        if (p && p.price !== 'N/A') prices[w.symbol] = p;
-      } catch { /* ignore */ }
+    try {
+      const results = await Promise.allSettled(watchlist.map(async (item) => {
+        const response = await api.getPrice(item.symbol);
+        const price = Number(response?.price);
+        if (!Number.isFinite(price) || price <= 0) return null;
+        return [item.symbol, { ...response, price }];
+      }));
+      setLivePrices(Object.fromEntries(
+        results
+          .filter((result) => result.status === 'fulfilled' && result.value)
+          .map((result) => result.value),
+      ));
+    } finally {
+      setRefreshing(false);
     }
-    setLivePrices(prices);
-    setRefreshing(false);
   };
 
   return (
@@ -66,7 +92,7 @@ export default function WatchlistPage({ user }) {
       </div>
 
       <div className="flex-row gap-8 mb-24">
-        <button className="btn btn-primary" onClick={() => setShowForm(!showForm)} id="watchlist-add-btn">
+        <button className="btn btn-primary" onClick={() => setShowForm(!showForm)} id="watchlist-add-btn" disabled={isGuest}>
           <Plus size={16} /> Add Alert
         </button>
         <button className="btn btn-outline" onClick={refreshPrices} disabled={refreshing} id="watchlist-refresh-btn">
@@ -77,7 +103,7 @@ export default function WatchlistPage({ user }) {
       {/* Add Form */}
       <AnimatePresence>
         {showForm && (
-          <motion.div
+          <Motion.div
             className="card mb-24"
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: 'auto' }}
@@ -113,7 +139,7 @@ export default function WatchlistPage({ user }) {
                 <button className="btn btn-ghost" type="button" onClick={() => setShowForm(false)}>Cancel</button>
               </div>
             </form>
-          </motion.div>
+          </Motion.div>
         )}
       </AnimatePresence>
 
@@ -127,11 +153,12 @@ export default function WatchlistPage({ user }) {
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           {watchlist.map((w, i) => {
             const live = livePrices[w.symbol];
-            const hit = live && (
-              w.alert_dir === 'below' ? parseFloat(live.price) <= w.alert_price : parseFloat(live.price) >= w.alert_price
+            const alertPrice = Number(w.alert_price);
+            const hit = live && Number.isFinite(alertPrice) && (
+              w.alert_dir === 'below' ? live.price <= alertPrice : live.price >= alertPrice
             );
             return (
-              <motion.div
+              <Motion.div
                 key={w.id}
                 className="holding-row"
                 initial={{ opacity: 0, y: 8 }}
@@ -161,7 +188,7 @@ export default function WatchlistPage({ user }) {
                     <X size={14} />
                   </button>
                 </div>
-              </motion.div>
+              </Motion.div>
             );
           })}
         </div>

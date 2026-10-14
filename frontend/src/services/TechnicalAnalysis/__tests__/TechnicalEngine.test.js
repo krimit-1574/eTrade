@@ -5,6 +5,7 @@ import { MarketStructureAnalyzer } from '../MarketStructureAnalyzer';
 import { SetupAnalyzer } from '../SetupAnalyzer';
 import { AITradingDecisionEngine } from '../AITradingDecisionEngine';
 import { RiskManager } from '../RiskManager';
+import { calculateIntradayVWAP } from '../../technicalCalculations';
 
 describe('Technical Analysis Engine', () => {
   
@@ -38,6 +39,29 @@ describe('Technical Analysis Engine', () => {
       const data = [{ volume: 100 }, { volume: 200 }];
       expect(IndicatorEngine.VolumeAverage(data, 2)).toBe(150);
     });
+
+    it('returns neutral RSI for a flat market', () => {
+      const data = Array.from({ length: 20 }, () => ({ close: 100 }));
+      expect(IndicatorEngine.RSI(data, 14)).toBe(50);
+    });
+
+    it('compares current volume with the preceding period', () => {
+      const data = [
+        ...Array.from({ length: 20 }, () => ({ volume: 100 })),
+        { volume: 1000 },
+      ];
+      expect(IndicatorEngine.RelativeVolume(data, 20)).toBe(10);
+    });
+
+    it('does not invent volume for zero-volume candles', () => {
+      const data = [
+        { time: '2026-10-14T09:15:00Z', high: 11, low: 9, close: 10, volume: 100 },
+        { time: '2026-10-14T09:20:00Z', high: 101, low: 99, close: 100, volume: 0 },
+      ];
+
+      expect(IndicatorEngine.VWAP(data)).toBe(10);
+      expect(calculateIntradayVWAP(data).at(-1).value).toBe(10);
+    });
   });
 
   describe('CandlestickPatternDetector', () => {
@@ -63,6 +87,21 @@ describe('Technical Analysis Engine', () => {
         { open: 10, high: 12, low: 8, close: 10.05 } // Body is very small compared to range
       ];
       expect(CandlestickPatternDetector.isDoji(data)).toBe(true);
+    });
+
+    it('detects two-candle patterns without requiring a third candle', () => {
+      const data = [
+        { open: 10, high: 11, low: 7, close: 8 },
+        { open: 7, high: 12, low: 6, close: 11 },
+      ];
+
+      expect(CandlestickPatternDetector.detectAll(data)).toContain('bullish_engulfing');
+    });
+
+    it('handles empty input safely', () => {
+      expect(CandlestickPatternDetector.detectAll([])).toEqual([]);
+      expect(CandlestickPatternDetector.isDoji([])).toBe(false);
+      expect(CandlestickPatternDetector.isBullishEngulfing([])).toBe(false);
     });
   });
 
@@ -95,12 +134,20 @@ describe('Technical Analysis Engine', () => {
     });
 
     it('generates a valid analysis object for a downtrend', () => {
-      const mockData = generateMockTrendData(100, 100, 'down');
+      const mockData = generateMockTrendData(100, 300, 'down');
       const analysis = SetupAnalyzer.analyze('TEST', mockData);
       
       expect(analysis.trend).toBe('bearish');
       expect(analysis.priceVsVWAP).toBe('below');
       expect(analysis.setupStrength).toBeLessThan(50);
+    });
+
+    it('rejects insufficient or malformed OHLC data', () => {
+      expect(SetupAnalyzer.analyze('TEST', generateMockTrendData(49, 100, 'up'))).toBeNull();
+
+      const malformed = generateMockTrendData(50, 100, 'up');
+      malformed[25] = { ...malformed[25], low: malformed[25].high + 1 };
+      expect(SetupAnalyzer.analyze('TEST', malformed)).toBeNull();
     });
   });
 

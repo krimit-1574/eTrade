@@ -8,30 +8,73 @@ import { IndicatorEngine } from './IndicatorEngine';
 import { MarketStructureAnalyzer } from './MarketStructureAnalyzer';
 import { CandlestickPatternDetector } from './CandlestickPatternDetector';
 
+const MIN_ANALYSIS_CANDLES = 50;
+
+function normalizeCandles(data) {
+  if (!Array.isArray(data) || data.length < MIN_ANALYSIS_CANDLES) return null;
+
+  const normalized = data.map((candle) => {
+    const open = Number(candle?.open);
+    const high = Number(candle?.high);
+    const low = Number(candle?.low);
+    const close = Number(candle?.close);
+    const volume = candle?.volume == null ? 0 : Number(candle.volume);
+    const timestamp = typeof candle?.time === 'number'
+      ? candle.time * 1000
+      : new Date(candle?.time).getTime();
+
+    if (
+      ![open, high, low, close, volume, timestamp].every(Number.isFinite)
+      || open <= 0
+      || high <= 0
+      || low <= 0
+      || close <= 0
+      || volume < 0
+      || high < Math.max(open, close)
+      || low > Math.min(open, close)
+      || high < low
+    ) {
+      return null;
+    }
+
+    return { ...candle, open, high, low, close, volume, _timestamp: timestamp };
+  });
+
+  if (normalized.some((candle) => candle === null)) return null;
+  return normalized
+    .sort((a, b) => a._timestamp - b._timestamp)
+    .map((item) => {
+      const candle = { ...item };
+      delete candle._timestamp;
+      return candle;
+    });
+}
+
 export const SetupAnalyzer = {
   
   analyze(symbol, data, marketContext = null) {
-    if (!data || data.length === 0) return null;
+    const candles = normalizeCandles(data);
+    if (!candles) return null;
 
-    const currentPrice = data[data.length - 1].close;
+    const currentPrice = candles[candles.length - 1].close;
     
     // 1. Calculate Indicators
-    const ema9 = IndicatorEngine.EMA(data, 9);
-    const ema20 = IndicatorEngine.EMA(data, 20);
-    const ema50 = IndicatorEngine.EMA(data, 50);
-    const rsi = IndicatorEngine.RSI(data, 14);
-    const atr = IndicatorEngine.ATR(data, 14);
-    const vwap = IndicatorEngine.VWAP(data);
-    const rvol = IndicatorEngine.RelativeVolume(data, 20);
-    const macdData = IndicatorEngine.MACD(data);
+    const ema9 = IndicatorEngine.EMA(candles, 9);
+    const ema20 = IndicatorEngine.EMA(candles, 20);
+    const ema50 = IndicatorEngine.EMA(candles, 50);
+    const rsi = IndicatorEngine.RSI(candles, 14);
+    const atr = IndicatorEngine.ATR(candles, 14);
+    const vwap = IndicatorEngine.VWAP(candles);
+    const rvol = IndicatorEngine.RelativeVolume(candles, 20);
+    const macdData = IndicatorEngine.MACD(candles);
 
     // 2. Analyze Structure & S/R
-    const structure = MarketStructureAnalyzer.analyzeStructure(data);
+    const structure = MarketStructureAnalyzer.analyzeStructure(candles);
     const trend = MarketStructureAnalyzer.detectTrend(currentPrice, ema9, ema20, ema50, structure);
-    const { support, resistance } = MarketStructureAnalyzer.getSupportResistance(data);
+    const { support, resistance } = MarketStructureAnalyzer.getSupportResistance(candles);
 
     // 3. Detect Candlestick Patterns
-    const detectedPatterns = CandlestickPatternDetector.detectAll(data);
+    const detectedPatterns = CandlestickPatternDetector.detectAll(candles);
 
     // 4. Evaluate Setup & Strength
     let setupStrength = 50; // Base neutral
@@ -157,13 +200,13 @@ export const SetupAnalyzer = {
       marketStructure: structure,
       priceVsVWAP: priceVsVWAP,
       emaAlignment: emaAlignment,
-      rsi: rsi ? Math.round(rsi) : null,
+      rsi: Number.isFinite(rsi) ? Math.round(rsi) : null,
       macd: macdData ? {
         histogram: parseFloat(macdData.histogram.toFixed(2)),
         signal: parseFloat(macdData.signal.toFixed(2)),
       } : null,
-      atr: atr ? parseFloat(atr.toFixed(2)) : null,
-      relativeVolume: rvol ? parseFloat(rvol.toFixed(1)) : null,
+      atr: Number.isFinite(atr) ? parseFloat(atr.toFixed(2)) : null,
+      relativeVolume: Number.isFinite(rvol) ? parseFloat(rvol.toFixed(1)) : null,
       volumeCondition: volumeCondition,
       detectedPatterns: detectedPatterns,
       support: support,

@@ -23,6 +23,7 @@ import { SetupAnalyzer } from './SetupAnalyzer';
 import { AITradingDecisionEngine } from './AITradingDecisionEngine';
 import { RiskEngine } from './RiskEngine';
 import { PaperBroker } from './PaperBroker';
+import { PaperTradingAccount } from './PaperTradingAccount';
 import { PositionManager, POSITION_DECISION } from './PositionManager';
 import { SessionJournalService } from './SessionJournalService';
 import { MarketContextService } from './MarketContextService';
@@ -50,9 +51,22 @@ const TIMEFRAME_CONFIG = {
   '30m': { period: '1mo', interval: '30m' },
 };
 
+function normalizeSymbol(symbol) {
+  return String(symbol || '').trim().toUpperCase().replace(/\.NS$/, '');
+}
+
+function normalizeUserId(userId) {
+  return userId === undefined || userId === null || userId === '' ? 'guest' : String(userId);
+}
+
+function toFiniteNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
 // ─── Individual Session State ────────────────────────────────────
 function createSessionState(symbol, config = {}) {
-  const cleanSymbol = (symbol || '').toUpperCase().replace('.NS', '');
+  const cleanSymbol = normalizeSymbol(symbol);
   const formattedSymbol = cleanSymbol.includes('.') ? cleanSymbol : `${cleanSymbol}.NS`;
 
   return {
@@ -61,6 +75,8 @@ function createSessionState(symbol, config = {}) {
     symbol: cleanSymbol,
     formattedSymbol,
     timeframe: config.timeframe || '5m',
+    userId: normalizeUserId(config.userId),
+    startingCapital: toFiniteNumber(config.startingCapital, 100000),
 
     // Status
     status: SESSION_STATUS.INITIALIZING,
@@ -73,7 +89,8 @@ function createSessionState(symbol, config = {}) {
     change: 0,
     changePct: 0,
     chartData: [],
-    isStaleData: false,
+    // A session is safe to trade only after both quote and candle feeds succeed.
+    isStaleData: true,
     lastTickTime: null,
 
     // Analysis
@@ -107,11 +124,17 @@ function createSessionState(symbol, config = {}) {
     // Internal polling refs (not serialized)
     _priceInterval: null,
     _candleInterval: null,
+    _priceRequestId: 0,
+    _candleRequestId: 0,
+    _priceStale: true,
+    _candleStale: true,
+    _stopPromise: null,
+    _journal: null,
   };
 }
 
 // ─── Singleton Manager ────────────────────────────────────────────
-class AISessionManagerSingleton {
+export class AISessionManagerSingleton {
   constructor() {
     /** @type {Map<string, object>} symbol → session state */
     this.sessions = new Map();
@@ -131,15 +154,34 @@ class AISessionManagerSingleton {
     /** Concurrency guard for order execution */
     this._orderLock = false;
 
+    this._eventSequence = 0;
+
     /** Market context refresh interval */
     this._contextInterval = null;
 
     this._initialized = false;
+
+    /** Owner for newly-created sessions. Captured on each session for isolation. */
+    this.userId = 'guest';
   }
 
   // ─── Initialization ──────────────────────────────────────────
-  initialize(account, riskSettings) {
-    this.account = account || this.account || PaperTradingAccount.load();
+  initialize(account, riskSettings, userId) {
+    const nextUserId = userId === undefined || userId === null
+      ? this.userId
+      : normalizeUserId(userId);
+
+    // A login boundary must never expose a previous user's in-memory sessions.
+    // The logout path should call shutdown() so positions are liquidated first;
+    // this synchronous quarantine is defense-in-depth if that cleanup is skipped.
+    if (this._initialized && nextUserId !== this.userId) {
+      this._clearRuntimeSessions();
+      this.account = null;
+      this.marketContext = null;
+    }
+
+    this.userId = nextUserId;
+    this.account = this.account || account || PaperTradingAccount.load();
     this.riskSettings = riskSettings || RiskEngine.loadSettings();
 
     if (this.account) {
@@ -153,11 +195,16 @@ class AISessionManagerSingleton {
       this._refreshMarketContext();
       this._contextInterval = setInterval(() => this._refreshMarketContext(), 60000);
     }
+
+    this._notifyListeners();
   }
 
   async _refreshMarketContext() {
     try {
-      this.marketContext = await MarketContextService.fetchMarketIndices();
+      const context = await MarketContextService.fetchMarketIndices();
+      if (!this._initialized) return;
+      this.marketContext = context;
+      this._notifyListeners();
     } catch (err) {
       console.warn('AISessionManager: market context refresh failed:', err);
     }
@@ -169,13 +216,28 @@ class AISessionManagerSingleton {
   }
 
   updateAccount(account) {
+    if (!account) return;
     this.account = account;
+    for (const symbol of this.sessions.keys()) {
+      this._syncPositionSummary(symbol);
+    }
     this._notifyListeners();
   }
 
   updateRiskSettings(settings) {
-    this.riskSettings = settings;
-    // Propagate to all active sessions
+    this.riskSettings = settings || RiskEngine.loadSettings();
+    if (this.account) {
+      if (!this.account.config) this.account.config = {};
+      const maxPositions = Number(this.riskSettings?.maxSimultaneousPositions);
+      if (Number.isFinite(maxPositions) && maxPositions > 0) {
+        this.account.config.maxSimultaneousPositions = maxPositions;
+      }
+      this._saveAccount();
+    }
+    // A settings change may make a previously rejected signal eligible again.
+    for (const session of this.getActiveSessions()) {
+      if (session.status === SESSION_STATUS.RISK_LIMIT) session.hasExecuted = false;
+    }
     this._notifyListeners();
   }
 
@@ -186,7 +248,11 @@ class AISessionManagerSingleton {
    * @returns {object} session state
    */
   startSession(symbol, config = {}) {
-    const cleanSymbol = (symbol || '').toUpperCase().replace('.NS', '');
+    const cleanSymbol = normalizeSymbol(symbol);
+    if (!cleanSymbol) {
+      console.warn('AISessionManager: Cannot start a session without a symbol');
+      return null;
+    }
 
     if (this.sessions.has(cleanSymbol)) {
       const existing = this.sessions.get(cleanSymbol);
@@ -198,16 +264,35 @@ class AISessionManagerSingleton {
       this.sessions.delete(cleanSymbol);
     }
 
-    // Check max simultaneous sessions from risk settings
-    const maxSessions = this.riskSettings?.maxSimultaneousPositions || 5;
+    // Monitoring sessions and funded positions are separate limits. The Risk
+    // Engine remains authoritative for maxSimultaneousPositions at execution.
+    const configuredMax = Number(this.riskSettings?.maxSimultaneousSessions);
+    const maxSessions = Number.isFinite(configuredMax) && configuredMax > 0
+      ? Math.floor(configuredMax)
+      : 10;
     const activeSessions = this.getActiveSessions();
     if (activeSessions.length >= maxSessions) {
       console.warn(`AISessionManager: Max simultaneous sessions (${maxSessions}) reached`);
       return null;
     }
 
-    const session = createSessionState(cleanSymbol, config);
+    const session = createSessionState(cleanSymbol, {
+      ...config,
+      userId: this.userId,
+      startingCapital: this.account?.accountValue ?? this.account?.initialCapital,
+      timeframe: TIMEFRAME_CONFIG[config.timeframe] ? config.timeframe : '5m',
+    });
+
+    // Resume ownership of a persisted open position after a page refresh so
+    // the eventual journal includes the original trade rather than orphaning it.
+    const existingPosition = this._getPositionForSymbol(cleanSymbol);
+    if (existingPosition?.sessionId) {
+      session.id = existingPosition.sessionId;
+      session.startedAt = existingPosition.entryTime || session.startedAt;
+    }
     this.sessions.set(cleanSymbol, session);
+    this._syncPositionSummary(cleanSymbol);
+    if (session.hasPosition) session.status = SESSION_STATUS.POSITION_ACTIVE;
 
     // Start background loops
     this._startSessionPolling(cleanSymbol);
@@ -221,51 +306,77 @@ class AISessionManagerSingleton {
    * builds and persists the session journal.
    */
   async stopSession(symbol) {
-    const cleanSymbol = (symbol || '').toUpperCase().replace('.NS', '');
+    const cleanSymbol = normalizeSymbol(symbol);
     const session = this.sessions.get(cleanSymbol);
     if (!session) return null;
+    if (session._stopPromise) return session._stopPromise;
+    if (!session.isActive) return session._journal;
 
+    session._stopPromise = this._stopSession(session);
+    try {
+      return await session._stopPromise;
+    } finally {
+      session._stopPromise = null;
+    }
+  }
+
+  async _stopSession(session) {
+    const { symbol } = session;
     session.isActive = false;
     session.status = SESSION_STATUS.STOPPED;
     session.stoppedAt = new Date().toISOString();
+    session._priceRequestId += 1;
+    session._candleRequestId += 1;
+    this._stopSessionPolling(symbol);
 
-    // Stop polling
-    this._stopSessionPolling(cleanSymbol);
+    await this._executeWithLock(async () => {
+      const position = this._getPositionForSymbol(symbol);
+      if (!position) return;
 
-    // Liquidate any open position for this symbol
-    if (this._hasPositionForSymbol(cleanSymbol) && session.price > 0) {
-      await this._executeWithLock(async () => {
-        const position = this._getPositionForSymbol(cleanSymbol);
-        if (position) {
-          const { account: closedAccount, events } = PaperBroker.closePosition(
-            this.account,
-            session.price,
-            'AI session manually stopped by user.',
-            null, // exitQuantity (full)
-            cleanSymbol
-          );
-          this.account = closedAccount;
-          this._saveAccount();
-          session.timeline.push(...events);
-          session.hasPosition = false;
-          session.positionSummary = null;
-          session.tradeLevels = null;
-        }
-      });
-    }
+      // A stop must not orphan an open position merely because the latest
+      // quote request failed. Use the most recent known mark as a fallback.
+      const exitPrice = [session.price, position.currentPrice, position.entryPrice]
+        .map(Number)
+        .find(price => Number.isFinite(price) && price > 0);
+      if (!exitPrice) {
+        session.timeline.push(this._timelineEvent(
+          'Position could not be liquidated',
+          'No valid market or position price is available. The position remains open.',
+          'error'
+        ));
+        return;
+      }
 
-    // Build and persist session journal
+      const result = PaperBroker.closePosition(
+        this.account,
+        exitPrice,
+        'AI session manually stopped by user.',
+        null,
+        symbol
+      );
+      this.account = result.account;
+      this._saveAccount();
+      session.timeline.push(...(result.events || []));
+      this._syncPositionSummary(symbol);
+      if (!session.hasPosition) session.tradeLevels = null;
+    });
+
     let sessionData = null;
     try {
       sessionData = SessionJournalService.buildSessionPayload({
         account: this.account,
-        symbol: cleanSymbol,
+        symbol,
+        timelineEvents: session.timeline,
         decisions: session.decisions,
-        userId: 'guest',
+        userId: session.userId,
+        sessionId: session.id,
+        startTime: session.startedAt,
+        startingCapital: session.startingCapital,
       });
       await SessionJournalService.saveSession(sessionData);
+      session._journal = sessionData;
     } catch (err) {
-      console.warn(`AISessionManager: Failed to persist session for ${cleanSymbol}:`, err);
+      console.warn(`AISessionManager: Failed to persist session for ${symbol}:`, err);
     }
 
     this._notifyListeners();
@@ -303,7 +414,7 @@ class AISessionManagerSingleton {
    * Returns session state for a specific symbol.
    */
   getSession(symbol) {
-    const cleanSymbol = (symbol || '').toUpperCase().replace('.NS', '');
+    const cleanSymbol = normalizeSymbol(symbol);
     return this.sessions.get(cleanSymbol) || null;
   }
 
@@ -311,7 +422,7 @@ class AISessionManagerSingleton {
    * Checks if a session exists and is active for the given symbol.
    */
   isSessionActive(symbol) {
-    const cleanSymbol = (symbol || '').toUpperCase().replace('.NS', '');
+    const cleanSymbol = normalizeSymbol(symbol);
     const session = this.sessions.get(cleanSymbol);
     return session?.isActive || false;
   }
@@ -322,18 +433,20 @@ class AISessionManagerSingleton {
     const session = this.sessions.get(symbol);
     if (!session) return;
 
+    this._stopSessionPolling(symbol);
+
     // Initial data fetch
-    this._fetchPrice(symbol);
-    this._fetchCandles(symbol);
+    void this._fetchPrice(symbol);
+    void this._fetchCandles(symbol);
 
     // Price tick every 10 seconds
     session._priceInterval = setInterval(() => {
-      if (session.isActive) this._fetchPrice(symbol);
+      if (session.isActive) void this._fetchPrice(symbol);
     }, 10000);
 
     // Candle refresh every 30 seconds
     session._candleInterval = setInterval(() => {
-      if (session.isActive) this._fetchCandles(symbol);
+      if (session.isActive) void this._fetchCandles(symbol);
     }, 30000);
   }
 
@@ -354,26 +467,40 @@ class AISessionManagerSingleton {
   async _fetchPrice(symbol) {
     const session = this.sessions.get(symbol);
     if (!session || !session.isActive) return;
+    const requestId = ++session._priceRequestId;
 
     try {
       const res = await api.getPrice(session.formattedSymbol);
-      if (res && res.price !== 'N/A') {
-        session.price = parseFloat(res.price || 0);
-        session.change = parseFloat(res.change || 0);
-        session.changePct = parseFloat(res.pct || 0);
-        session.isStaleData = false;
+      if (!this._isCurrentRequest(symbol, session, '_priceRequestId', requestId)) return;
+
+      const price = Number(res?.price);
+      if (res?.price !== 'N/A' && Number.isFinite(price) && price > 0) {
+        session.price = price;
+        session.change = toFiniteNumber(res.change);
+        session.changePct = toFiniteNumber(res.pct ?? res.changePct);
+        session._priceStale = false;
+        this._syncStaleState(session);
         session.lastTickTime = Date.now();
 
         // Run position management on each tick
-        this._evaluatePosition(symbol);
+        await this._evaluatePosition(symbol, session);
         this._notifyListeners();
       } else {
-        session.isStaleData = true;
+        session._priceStale = true;
+        this._syncStaleState(session);
+        if (session.status !== SESSION_STATUS.POSITION_ACTIVE) {
+          session.status = SESSION_STATUS.DATA_DISCONNECTED;
+        }
         this._notifyListeners();
       }
     } catch (err) {
+      if (!this._isCurrentRequest(symbol, session, '_priceRequestId', requestId)) return;
       console.warn(`AISessionManager: Price fetch failed for ${symbol}:`, err);
-      session.isStaleData = true;
+      session._priceStale = true;
+      this._syncStaleState(session);
+      if (session.status !== SESSION_STATUS.POSITION_ACTIVE) {
+        session.status = SESSION_STATUS.DATA_DISCONNECTED;
+      }
       this._notifyListeners();
     }
   }
@@ -381,36 +508,53 @@ class AISessionManagerSingleton {
   async _fetchCandles(symbol) {
     const session = this.sessions.get(symbol);
     if (!session || !session.isActive) return;
+    const requestId = ++session._candleRequestId;
 
     try {
       const config = TIMEFRAME_CONFIG[session.timeframe] || TIMEFRAME_CONFIG['5m'];
       const res = await api.getHistory(session.formattedSymbol, config.period, config.interval);
+      if (!this._isCurrentRequest(symbol, session, '_candleRequestId', requestId)) return;
 
-      if (res && Array.isArray(res.data) && res.data.length > 0) {
-        session.chartData = res.data;
-        session.isStaleData = false;
+      let candles = Array.isArray(res?.data) ? res.data : [];
 
-        // Run technical analysis
-        const analysis = SetupAnalyzer.analyze(session.symbol, res.data, this.marketContext);
-        session.technicalAnalysis = analysis;
-
-        // Evaluate trading decision
-        this._evaluateDecision(symbol);
-        this._notifyListeners();
-      } else {
+      if (candles.length === 0) {
         // Fallback to longer timeframe
         const fallbackRes = await api.getHistory(session.formattedSymbol, '5d', '15m');
-        if (fallbackRes && Array.isArray(fallbackRes.data) && fallbackRes.data.length > 0) {
-          session.chartData = fallbackRes.data;
-          const analysis = SetupAnalyzer.analyze(session.symbol, fallbackRes.data, this.marketContext);
-          session.technicalAnalysis = analysis;
-          this._evaluateDecision(symbol);
-          this._notifyListeners();
-        }
+        if (!this._isCurrentRequest(symbol, session, '_candleRequestId', requestId)) return;
+        candles = Array.isArray(fallbackRes?.data) ? fallbackRes.data : [];
       }
+
+      if (candles.length === 0) {
+        session._candleStale = true;
+        this._syncStaleState(session);
+        if (session.status !== SESSION_STATUS.POSITION_ACTIVE) {
+          session.status = SESSION_STATUS.DATA_DISCONNECTED;
+        }
+        this._notifyListeners();
+        return;
+      }
+
+      session.chartData = candles;
+      session._candleStale = false;
+      this._syncStaleState(session);
+      session.marketContext = this.marketContext;
+
+      const analysis = SetupAnalyzer.analyze(session.symbol, candles, this.marketContext);
+      session.technicalAnalysis = analysis;
+
+      if (analysis) {
+        await this._evaluateDecision(symbol, session);
+      } else if (!session.hasPosition) {
+        session.tradeDecision = AITradingDecisionEngine.evaluate(null, session.price, this.marketContext);
+        session.tradeLevels = null;
+        session.status = session.isStaleData ? SESSION_STATUS.DATA_DISCONNECTED : SESSION_STATUS.WAITING;
+      }
+      this._notifyListeners();
     } catch (err) {
+      if (!this._isCurrentRequest(symbol, session, '_candleRequestId', requestId)) return;
       console.warn(`AISessionManager: Candle fetch failed for ${symbol}:`, err);
-      session.isStaleData = true;
+      session._candleStale = true;
+      this._syncStaleState(session);
       if (session.status !== SESSION_STATUS.POSITION_ACTIVE) {
         session.status = SESSION_STATUS.DATA_DISCONNECTED;
       }
@@ -420,9 +564,9 @@ class AISessionManagerSingleton {
 
   // ─── Trading Decision Engine ─────────────────────────────────
 
-  _evaluateDecision(symbol) {
+  async _evaluateDecision(symbol, expectedSession = null) {
     const session = this.sessions.get(symbol);
-    if (!session || !session.isActive || !session.technicalAnalysis || session.price <= 0) return;
+    if (!session || session !== (expectedSession || session) || !session.isActive || !session.technicalAnalysis || session.price <= 0) return;
 
     try {
       const decision = AITradingDecisionEngine.evaluate(
@@ -476,7 +620,7 @@ class AISessionManagerSingleton {
         !this._hasPositionForSymbol(symbol) &&
         !session.hasExecuted
       ) {
-        this._attemptTradeExecution(symbol, decision);
+        await this._attemptTradeExecution(symbol, decision, session);
       }
 
       // Reset execution flag when decision returns to WAIT
@@ -492,11 +636,9 @@ class AISessionManagerSingleton {
 
   // ─── Trade Execution (with concurrency lock) ──────────────────
 
-  async _attemptTradeExecution(symbol, decision) {
+  async _attemptTradeExecution(symbol, decision, expectedSession = null) {
     const session = this.sessions.get(symbol);
-    if (!session || !session.isActive) return;
-
-    session.hasExecuted = true;
+    if (!session || session !== (expectedSession || session) || !session.isActive) return;
 
     // Stale data guard
     if (session.isStaleData) {
@@ -512,6 +654,21 @@ class AISessionManagerSingleton {
     }
 
     await this._executeWithLock(async () => {
+      // The lock can be queued behind another symbol. Revalidate everything
+      // after acquiring it so an obsolete signal cannot execute later.
+      if (
+        this.sessions.get(symbol) !== session ||
+        !session.isActive ||
+        session.isStaleData ||
+        session.tradeDecision !== decision ||
+        this._hasPositionForSymbol(symbol) ||
+        session.hasExecuted
+      ) {
+        return;
+      }
+
+      session.hasExecuted = true;
+
       // Risk Engine validation (atomic)
       const validation = RiskEngine.validateTrade({
         account: this.account,
@@ -535,6 +692,7 @@ class AISessionManagerSingleton {
         accepted: validation.approved,
         rejectionReason: validation.approved ? null : `${validation.reason} [${validation.code}]`,
       });
+      if (session.decisions.length > 500) session.decisions.splice(0, session.decisions.length - 500);
 
       if (!validation.approved) {
         session.timeline.push({
@@ -549,7 +707,7 @@ class AISessionManagerSingleton {
       }
 
       // Execute paper order
-      const { account: updatedAccount, events: orderEvents } = PaperBroker.executeMarketOrder(
+      const execution = PaperBroker.executeMarketOrder(
         this.account,
         {
           symbol: session.symbol,
@@ -561,16 +719,30 @@ class AISessionManagerSingleton {
           setup: decision.setup,
           confidence: decision.confidence,
           customQuantity: validation.quantity,
+          sessionId: session.id,
         }
       );
 
-      this.account = updatedAccount;
+      this.account = execution.account;
       this._saveAccount();
+
+      const orderEvents = execution.events || [];
+      const pos = this._getPositionForSymbol(symbol);
+      if (!execution.order || !pos || (pos.sessionId && pos.sessionId !== session.id)) {
+        session.timeline.push(...orderEvents);
+        session.timeline.push(this._timelineEvent(
+          'Paper order was not filled',
+          `The broker rejected or could not create a position for ${session.symbol}.`,
+          'error'
+        ));
+        session.status = SESSION_STATUS.RISK_LIMIT;
+        this._syncPositionSummary(symbol);
+        return;
+      }
 
       // Add chart marker
       const latestCandle = session.chartData[session.chartData.length - 1];
       const candleTime = latestCandle?.time || latestCandle?.date;
-      const pos = this._getPositionForSymbol(symbol);
       if (candleTime && pos) {
         session.markers.push({
           time: candleTime,
@@ -604,56 +776,42 @@ class AISessionManagerSingleton {
 
   // ─── Position Management (runs on each price tick) ────────────
 
-  _evaluatePosition(symbol) {
+  async _evaluatePosition(symbol, expectedSession = null) {
     const session = this.sessions.get(symbol);
-    if (!session || !session.isActive || session.price <= 0) return;
+    if (!session || session !== (expectedSession || session) || !session.isActive || session.price <= 0) return;
 
-    if (!this._hasPositionForSymbol(symbol)) {
-      session.hasPosition = false;
-      session.positionSummary = null;
-      // Only clear tradeLevels if we also have no pending decision
-      if (!session.tradeDecision || session.tradeDecision.decision === 'WAIT') {
-        session.tradeLevels = null;
+    await this._executeWithLock(async () => {
+      if (this.sessions.get(symbol) !== session || !session.isActive || session.price <= 0) return;
+
+      let position = this._getPositionForSymbol(symbol);
+      if (!position) {
+        session.hasPosition = false;
+        session.positionSummary = null;
+        if (!session.tradeDecision || session.tradeDecision.decision === 'WAIT') {
+          session.tradeLevels = null;
+        }
+        return;
       }
-      return;
-    }
 
-    const position = this._getPositionForSymbol(symbol);
-    if (!position) return;
+      // Update the requested symbol, not the legacy activePosition alias. This
+      // keeps every position's P&L isolated in a multi-stock account.
+      this.account = PaperTradingAccount.updateMarketPrice(this.account, symbol, session.price);
+      position = this._getPositionForSymbol(symbol);
+      if (!position) return;
 
-    // Update unrealized P&L on the account
-    const updatedAccount = { ...this.account };
-    if (updatedAccount.activePosition && updatedAccount.activePosition.symbol === symbol) {
-      const pos = updatedAccount.activePosition;
-      if (pos.direction === 'LONG') {
-        pos.unrealizedPnL = (session.price - pos.entryPrice) * pos.quantity;
-      } else {
-        pos.unrealizedPnL = (pos.entryPrice - session.price) * pos.quantity;
-      }
-      pos.currentPrice = session.price;
-      pos.pnlPct = pos.entryPrice > 0 ? ((pos.unrealizedPnL / (pos.entryPrice * pos.quantity)) * 100) : 0;
-      updatedAccount.unrealizedPnL = pos.unrealizedPnL;
-      updatedAccount.accountValue = updatedAccount.availableCash + updatedAccount.usedCapital + updatedAccount.unrealizedPnL;
-    }
-    this.account = updatedAccount;
+      const evaluation = PositionManager.evaluatePosition({
+        position,
+        currentPrice: session.price,
+        candleHigh: session.price,
+        candleLow: session.price,
+        technicalAnalysis: session.technicalAnalysis,
+        latestDecision: session.tradeDecision,
+        riskSettings: this.riskSettings,
+      });
 
-    // Run PositionManager evaluation
-    const evaluation = PositionManager.evaluatePosition({
-      position,
-      currentPrice: session.price,
-      candleHigh: session.price, // Use current price as proxy when no candle high available
-      candleLow: session.price,
-      technicalAnalysis: session.technicalAnalysis,
-      latestDecision: session.tradeDecision,
-      riskSettings: this.riskSettings,
-    });
-
-    const latestCandle = session.chartData[session.chartData.length - 1];
-    const candleTime = latestCandle?.time || latestCandle?.date;
-
-    // Execute position management decisions
-    this._executeWithLock(async () => {
-      let currentAccount = { ...this.account };
+      const latestCandle = session.chartData[session.chartData.length - 1];
+      const candleTime = latestCandle?.time || latestCandle?.date;
+      let currentAccount = this.account;
 
       if (evaluation.action === POSITION_DECISION.PARTIAL_EXIT) {
         const exitResult = PaperBroker.closePosition(
@@ -663,7 +821,7 @@ class AISessionManagerSingleton {
         session.timeline.push(...exitResult.events);
 
         // Move stop to breakeven
-        const pos = this._getPositionForSymbol(symbol);
+        const pos = this._getPositionForSymbol(symbol, currentAccount);
         if (pos) {
           const beStop = pos.direction === 'LONG'
             ? parseFloat((pos.entryPrice * 1.0005).toFixed(2))
@@ -738,27 +896,25 @@ class AISessionManagerSingleton {
         session.tradeLevels = null;
       }
     });
-
-    this._notifyListeners();
   }
 
   // ─── Position Helpers ─────────────────────────────────────────
 
   _hasPositionForSymbol(symbol) {
-    const cleanSym = (symbol || '').toUpperCase().replace('.NS', '');
+    const cleanSym = normalizeSymbol(symbol);
     if (this.account?.activePositions && this.account.activePositions.length > 0) {
-      return this.account.activePositions.some(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanSym);
+      return this.account.activePositions.some(p => normalizeSymbol(p.symbol) === cleanSym);
     }
-    return (this.account?.activePosition?.symbol || '').toUpperCase().replace('.NS', '') === cleanSym;
+    return normalizeSymbol(this.account?.activePosition?.symbol) === cleanSym;
   }
 
-  _getPositionForSymbol(symbol) {
-    const cleanSym = (symbol || '').toUpperCase().replace('.NS', '');
-    if (this.account?.activePositions && this.account.activePositions.length > 0) {
-      return this.account.activePositions.find(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanSym) || null;
+  _getPositionForSymbol(symbol, account = this.account) {
+    const cleanSym = normalizeSymbol(symbol);
+    if (account?.activePositions && account.activePositions.length > 0) {
+      return account.activePositions.find(p => normalizeSymbol(p.symbol) === cleanSym) || null;
     }
-    if ((this.account?.activePosition?.symbol || '').toUpperCase().replace('.NS', '') === cleanSym) {
-      return this.account.activePosition;
+    if (normalizeSymbol(account?.activePosition?.symbol) === cleanSym) {
+      return account.activePosition;
     }
     return null;
   }
@@ -777,10 +933,10 @@ class AISessionManagerSingleton {
         target1: pos.target1,
         target2: pos.target2,
         quantity: pos.quantity,
-        remainingQuantity: pos.remainingQuantity || pos.quantity,
-        unrealizedPnL: pos.unrealizedPnL || 0,
-        pnlPct: pos.pnlPct || 0,
-        currentPrice: pos.currentPrice || session.price,
+        remainingQuantity: pos.remainingQuantity ?? pos.quantity,
+        unrealizedPnL: toFiniteNumber(pos.unrealizedPnL),
+        pnlPct: toFiniteNumber(pos.pnlPct),
+        currentPrice: toFiniteNumber(pos.currentPrice, session.price),
       };
     } else {
       session.hasPosition = false;
@@ -792,12 +948,30 @@ class AISessionManagerSingleton {
 
   _saveAccount() {
     try {
-      if (typeof sessionStorage !== 'undefined') {
-        sessionStorage.setItem('etrade_paper_account', JSON.stringify(this.account));
-      }
+      PaperTradingAccount.save(this.account);
     } catch (e) {
       console.warn('AISessionManager: Failed to save account', e);
     }
+  }
+
+  _isCurrentRequest(symbol, session, requestField, requestId) {
+    return this.sessions.get(symbol) === session &&
+      session.isActive &&
+      session[requestField] === requestId;
+  }
+
+  _syncStaleState(session) {
+    session.isStaleData = Boolean(session._priceStale || session._candleStale);
+  }
+
+  _timelineEvent(title, detail, type = 'info') {
+    return {
+      id: `${Date.now()}_${++this._eventSequence}`,
+      time: new Date().toLocaleTimeString('en-US', { hour12: true }),
+      title,
+      detail,
+      type,
+    };
   }
 
   // ─── Concurrency Lock ─────────────────────────────────────────
@@ -823,7 +997,12 @@ class AISessionManagerSingleton {
    */
   subscribe(callback) {
     this.listeners.add(callback);
+    callback(this._getSnapshot());
     return () => this.listeners.delete(callback);
+  }
+
+  getSnapshot() {
+    return this._getSnapshot();
   }
 
   _notifyListeners() {
@@ -860,6 +1039,9 @@ class AISessionManagerSingleton {
           startedAt: session.startedAt,
           stoppedAt: session.stoppedAt,
           timeframe: session.timeframe,
+          lastTickTime: session.lastTickTime,
+          decisions: [...session.decisions],
+          userId: session.userId,
         }])
       ),
       account: this.account,
@@ -874,12 +1056,13 @@ class AISessionManagerSingleton {
    * Manually close the position for a given symbol.
    */
   async manualClosePosition(symbol) {
-    const cleanSymbol = (symbol || '').toUpperCase().replace('.NS', '');
+    const cleanSymbol = normalizeSymbol(symbol);
     const session = this.sessions.get(cleanSymbol);
     if (!session) return;
 
     if (this._hasPositionForSymbol(cleanSymbol) && session.price > 0) {
       await this._executeWithLock(async () => {
+        if (this.sessions.get(cleanSymbol) !== session || !this._hasPositionForSymbol(cleanSymbol)) return;
         const { account: updated, events } = PaperBroker.closePosition(
           this.account,
           session.price,
@@ -903,19 +1086,23 @@ class AISessionManagerSingleton {
    * Change timeframe for a session and refetch candles.
    */
   changeTimeframe(symbol, newTimeframe) {
-    const cleanSymbol = (symbol || '').toUpperCase().replace('.NS', '');
+    const cleanSymbol = normalizeSymbol(symbol);
     const session = this.sessions.get(cleanSymbol);
-    if (!session || !session.isActive) return;
+    if (!session || !session.isActive || !TIMEFRAME_CONFIG[newTimeframe]) return false;
 
     session.timeframe = newTimeframe;
-    this._fetchCandles(cleanSymbol);
+    session._candleStale = true;
+    this._syncStaleState(session);
+    void this._fetchCandles(cleanSymbol);
+    this._notifyListeners();
+    return true;
   }
 
   /**
    * Manually refresh price quote and candles for a session.
    */
   async refreshSession(symbol) {
-    const cleanSymbol = (symbol || '').toUpperCase().replace('.NS', '');
+    const cleanSymbol = normalizeSymbol(symbol);
     await Promise.allSettled([
       this._fetchPrice(cleanSymbol),
       this._fetchCandles(cleanSymbol),
@@ -928,16 +1115,37 @@ class AISessionManagerSingleton {
    * Full teardown — stops all sessions and clears intervals.
    */
   destroy() {
-    for (const [symbol] of this.sessions) {
-      this._stopSessionPolling(symbol);
-    }
+    this._clearRuntimeSessions();
     if (this._contextInterval) {
       clearInterval(this._contextInterval);
       this._contextInterval = null;
     }
-    this.sessions.clear();
     this.listeners.clear();
+    this.account = null;
+    this.riskSettings = null;
+    this.marketContext = null;
+    this.userId = 'guest';
     this._initialized = false;
+  }
+
+  _clearRuntimeSessions() {
+    for (const [symbol, session] of this.sessions) {
+      session.isActive = false;
+      session._priceRequestId += 1;
+      session._candleRequestId += 1;
+      this._stopSessionPolling(symbol);
+    }
+    this.sessions.clear();
+  }
+
+  /**
+   * Safe application/logout teardown. Active positions are liquidated and
+   * journals persisted before runtime state and timers are discarded.
+   */
+  async shutdown({ liquidate = true } = {}) {
+    const journals = liquidate ? await this.stopAllSessions() : [];
+    this.destroy();
+    return journals;
   }
 }
 

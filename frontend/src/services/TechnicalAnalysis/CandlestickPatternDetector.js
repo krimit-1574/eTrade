@@ -7,24 +7,33 @@
 export const CandlestickPatternDetector = {
   
   detectAll(data) {
-    if (!data || data.length < 3) return [];
+    if (!Array.isArray(data) || data.length === 0) return [];
     
     const patterns = [];
     
     if (this.isHammer(data)) patterns.push("hammer");
-    if (this.isInvertedHammer(data)) patterns.push("inverted_hammer");
-    if (this.isShootingStar(data)) patterns.push("shooting_star");
+    if (this.isInvertedHammer(data)) {
+      const priorCloses = data.slice(0, -1).slice(-3).map((candle) => Number(candle.close));
+      const wasRising = priorCloses.length >= 2 && priorCloses.at(-1) > priorCloses[0];
+      patterns.push(wasRising ? "shooting_star" : "inverted_hammer");
+    }
     if (this.isDoji(data)) patterns.push("doji");
-    if (this.isBullishEngulfing(data)) patterns.push("bullish_engulfing");
-    if (this.isBearishEngulfing(data)) patterns.push("bearish_engulfing");
-    if (this.isMorningStar(data)) patterns.push("morning_star");
-    if (this.isEveningStar(data)) patterns.push("evening_star");
-    if (this.isInsideBar(data)) patterns.push("inside_bar");
-    if (this.isOutsideBar(data)) patterns.push("outside_bar");
     if (this.isPinBar(data)) patterns.push("pin_bar");
     if (this.isMarubozu(data)) patterns.push("marubozu");
-    if (this.isTweezerTop(data)) patterns.push("tweezer_top");
-    if (this.isTweezerBottom(data)) patterns.push("tweezer_bottom");
+
+    if (data.length >= 2) {
+      if (this.isBullishEngulfing(data)) patterns.push("bullish_engulfing");
+      if (this.isBearishEngulfing(data)) patterns.push("bearish_engulfing");
+      if (this.isInsideBar(data)) patterns.push("inside_bar");
+      if (this.isOutsideBar(data)) patterns.push("outside_bar");
+      if (this.isTweezerTop(data)) patterns.push("tweezer_top");
+      if (this.isTweezerBottom(data)) patterns.push("tweezer_bottom");
+    }
+
+    if (data.length >= 3) {
+      if (this.isMorningStar(data)) patterns.push("morning_star");
+      if (this.isEveningStar(data)) patterns.push("evening_star");
+    }
 
     return patterns;
   },
@@ -52,6 +61,7 @@ export const CandlestickPatternDetector = {
   // --- Pattern Detectors (Looking at the most recent candles) ---
 
   isDoji(data) {
+    if (!Array.isArray(data) || data.length < 1) return false;
     const c = data[data.length - 1];
     const body = this.getBody(c);
     const range = this.getRange(c);
@@ -59,6 +69,7 @@ export const CandlestickPatternDetector = {
   },
 
   isHammer(data) {
+    if (!Array.isArray(data) || data.length < 1) return false;
     const c = data[data.length - 1];
     const body = this.getBody(c);
     const range = this.getRange(c);
@@ -72,6 +83,7 @@ export const CandlestickPatternDetector = {
   },
 
   isInvertedHammer(data) {
+    if (!Array.isArray(data) || data.length < 1) return false;
     // Looks like a shooting star but appears after a downtrend (we just check shape here)
     const c = data[data.length - 1];
     const body = this.getBody(c);
@@ -91,6 +103,7 @@ export const CandlestickPatternDetector = {
   },
 
   isBullishEngulfing(data) {
+    if (!Array.isArray(data) || data.length < 2) return false;
     const curr = data[data.length - 1];
     const prev = data[data.length - 2];
     
@@ -101,6 +114,7 @@ export const CandlestickPatternDetector = {
   },
 
   isBearishEngulfing(data) {
+    if (!Array.isArray(data) || data.length < 2) return false;
     const curr = data[data.length - 1];
     const prev = data[data.length - 2];
     
@@ -111,6 +125,7 @@ export const CandlestickPatternDetector = {
   },
 
   isInsideBar(data) {
+    if (!Array.isArray(data) || data.length < 2) return false;
     const curr = data[data.length - 1];
     const prev = data[data.length - 2];
     
@@ -118,6 +133,7 @@ export const CandlestickPatternDetector = {
   },
 
   isOutsideBar(data) {
+    if (!Array.isArray(data) || data.length < 2) return false;
     const curr = data[data.length - 1];
     const prev = data[data.length - 2];
     
@@ -125,6 +141,7 @@ export const CandlestickPatternDetector = {
   },
 
   isMorningStar(data) {
+    if (!Array.isArray(data) || data.length < 3) return false;
     const c3 = data[data.length - 1]; // Current
     const c2 = data[data.length - 2]; // Middle
     const c1 = data[data.length - 3]; // First
@@ -137,6 +154,7 @@ export const CandlestickPatternDetector = {
   },
 
   isEveningStar(data) {
+    if (!Array.isArray(data) || data.length < 3) return false;
     const c3 = data[data.length - 1]; 
     const c2 = data[data.length - 2]; 
     const c1 = data[data.length - 3]; 
@@ -149,6 +167,7 @@ export const CandlestickPatternDetector = {
   },
 
   isPinBar(data) {
+    if (!Array.isArray(data) || data.length < 1) return false;
     const c = data[data.length - 1];
     const range = this.getRange(c);
     const body = this.getBody(c);
@@ -164,6 +183,7 @@ export const CandlestickPatternDetector = {
   },
 
   isMarubozu(data) {
+    if (!Array.isArray(data) || data.length < 1) return false;
     const c = data[data.length - 1];
     const range = this.getRange(c);
     if (range === 0) return false;
@@ -173,6 +193,7 @@ export const CandlestickPatternDetector = {
   },
 
   isTweezerTop(data) {
+    if (!Array.isArray(data) || data.length < 2) return false;
     const curr = data[data.length - 1];
     const prev = data[data.length - 2];
     
@@ -182,6 +203,7 @@ export const CandlestickPatternDetector = {
   },
 
   isTweezerBottom(data) {
+    if (!Array.isArray(data) || data.length < 2) return false;
     const curr = data[data.length - 1];
     const prev = data[data.length - 2];
     

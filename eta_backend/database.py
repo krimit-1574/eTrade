@@ -3,17 +3,66 @@ import json
 import os
 import hashlib
 import binascii
+import hmac
+import math
+import secrets
+import time
+from datetime import datetime, timezone
 
-DB_PATH = "eta.db"
+DB_PATH = os.getenv(
+    "ETA_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "eta.db"),
+)
+
+DEFAULT_VIRTUAL_CASH = 1_000_000.0
+DEFAULT_AUTH_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+def _connect():
+    """Open a consistently configured SQLite connection."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 10000")
+    return conn
+
+
+def _canonical_symbol(symbol):
+    if not isinstance(symbol, str):
+        raise ValueError("Symbol must be a string.")
+    value = symbol.strip().upper()
+    if not value or len(value) > 64 or any(ord(ch) < 32 for ch in value):
+        raise ValueError("Invalid symbol.")
+    return value
+
+
+def _finite_positive(value, label):
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{label} must be a number.")
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{label} must be a finite number greater than zero.")
+    return number
 
 def is_guest(user_id):
-    return str(user_id) == 'guest'
+    return str(user_id).strip().lower() == 'guest'
 
 def normalize_user_id(user_id):
-    return str(user_id)
+    return str(user_id).strip()
+
+
+def user_exists(user_id):
+    if is_guest(user_id) or user_id is None:
+        return False
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone()
+        return row is not None
+    finally:
+        conn.close()
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, settings TEXT)''')
@@ -42,6 +91,52 @@ def init_db():
                  (id TEXT PRIMARY KEY, user_id TEXT, symbol TEXT, start_time TEXT, end_time TEXT,
                   starting_capital REAL, ending_capital REAL, status TEXT, realized_pnl REAL,
                   trade_count INTEGER, analytics_json TEXT, trades_json TEXT, decisions_json TEXT, created_at TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS paper_positions
+                 (id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,
+                  symbol TEXT NOT NULL, quantity REAL NOT NULL, buy_price REAL NOT NULL,
+                  UNIQUE(user_id, symbol))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS auth_sessions
+                 (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, created_at INTEGER NOT NULL,
+                  expires_at INTEGER NOT NULL, revoked_at INTEGER,
+                  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)''')
+    c.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_user ON portfolio(user_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id, id DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ai_sessions_user ON ai_sessions(user_id, created_at DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)")
+
+    # Migrate positions produced by older releases, where paper positions and
+    # manually entered portfolio holdings shared one table. Replaying the paper
+    # transaction ledger avoids importing free-form holdings into paper cash.
+    if c.execute("SELECT 1 FROM paper_positions LIMIT 1").fetchone() is None:
+        reconstructed = {}
+        rows = c.execute(
+            "SELECT user_id, symbol, name, order_type, quantity, price "
+            "FROM transactions ORDER BY id"
+        ).fetchall()
+        for uid, raw_symbol, name, side, raw_qty, raw_price in rows:
+            try:
+                symbol = _canonical_symbol(raw_symbol)
+                qty = _finite_positive(raw_qty, "Quantity")
+                price = _finite_positive(raw_price, "Price")
+            except ValueError:
+                continue
+            key = (normalize_user_id(uid), symbol)
+            current_qty, current_avg, current_name = reconstructed.get(key, (0.0, 0.0, name or symbol))
+            if str(side).upper() == "BUY":
+                new_qty = current_qty + qty
+                new_avg = ((current_qty * current_avg) + (qty * price)) / new_qty
+                reconstructed[key] = (new_qty, new_avg, name or current_name or symbol)
+            elif str(side).upper() == "SELL" and current_qty + 1e-9 >= qty:
+                new_qty = max(0.0, current_qty - qty)
+                reconstructed[key] = (new_qty, current_avg, current_name)
+        for (uid, symbol), (qty, avg_price, name) in reconstructed.items():
+            if qty > 1e-9:
+                c.execute(
+                    "INSERT OR IGNORE INTO paper_positions "
+                    "(user_id, name, symbol, quantity, buy_price) VALUES (?, ?, ?, ?, ?)",
+                    (uid, name or symbol, symbol, qty, avg_price),
+                )
     conn.commit()
     conn.close()
 
@@ -51,69 +146,173 @@ def hash_password(password):
     return binascii.hexlify(salt + pw_hash).decode('ascii')
 
 def check_password(password, hashed_password):
-    if not hashed_password: return False
+    if not hashed_password:
+        return False
     # If it's an old plain-text password from earlier dev work
-    if len(hashed_password) < 60: return password == hashed_password
+    if len(hashed_password) < 60:
+        return hmac.compare_digest(password, hashed_password)
     try:
         data = binascii.unhexlify(hashed_password)
+        if len(data) != 48:
+            return False
         salt = data[:16]
         stored_hash = data[16:]
         pw_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
-        return pw_hash == stored_hash
-    except:
-        return password == hashed_password
+        return hmac.compare_digest(pw_hash, stored_hash)
+    except (TypeError, ValueError, binascii.Error):
+        return False
 
 def create_user(username, password, email="", dob=""):
-    conn = sqlite3.connect(DB_PATH)
+    username = str(username).strip()
+    email = str(email).strip().lower()
+    conn = _connect()
     c = conn.cursor()
-    
-    if email:
-        c.execute("SELECT id FROM users WHERE email = ?", (email,))
-        if c.fetchone():
-            conn.close()
-            return None
-            
     try:
+        c.execute("BEGIN IMMEDIATE")
+        if email:
+            c.execute("SELECT id FROM users WHERE lower(email) = ?", (email,))
+            if c.fetchone():
+                conn.rollback()
+                return None
         c.execute("INSERT INTO users (username, password, settings, email, dob) VALUES (?, ?, ?, ?, ?)", 
                   (username, hash_password(password), json.dumps({'av_key': '', 'gemini_key': ''}), email, dob))
         conn.commit()
-        user_id = c.lastrowid
-        conn.close()
-        return user_id
+        return c.lastrowid
     except sqlite3.IntegrityError:
+        conn.rollback()
+        return None
+    finally:
+        conn.close()
+
+def verify_user(username, password):
+    identifier = str(username).strip()
+    conn = _connect()
+    c = conn.cursor()
+    # Allow logging in by either username or email
+    c.execute(
+        "SELECT id, password FROM users "
+        "WHERE username = ? OR lower(email) = lower(?) ORDER BY username = ? DESC LIMIT 1",
+        (identifier, identifier, identifier),
+    )
+    user = c.fetchone()
+    if not user or not check_password(password, user[1]):
         conn.close()
         return None
 
-def verify_user(username, password):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    # Allow logging in by either username or email
-    c.execute("SELECT id, password FROM users WHERE username = ? OR email = ?", (username, username))
-    user = c.fetchone()
+    # Upgrade legacy plaintext development passwords on successful login.
+    if len(user[1]) < 60:
+        c.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(password), user[0]))
+        conn.commit()
     conn.close()
-    
-    if user and check_password(password, user[1]):
-        return user[0]
-    return None
+    return user[0]
+
+
+def get_user(user_id):
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id, username, email, dob FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return {"user_id": row[0], "username": row[1], "email": row[2] or "", "dob": row[3] or ""}
+    finally:
+        conn.close()
+
+
+def _token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def create_auth_session(user_id, ttl_seconds=None):
+    if not user_exists(user_id):
+        raise ValueError("User not found.")
+    if ttl_seconds is None:
+        try:
+            ttl_seconds = int(os.getenv("AUTH_SESSION_TTL_SECONDS", DEFAULT_AUTH_TTL_SECONDS))
+        except (TypeError, ValueError):
+            ttl_seconds = DEFAULT_AUTH_TTL_SECONDS
+    ttl_seconds = max(300, min(int(ttl_seconds), 90 * 24 * 60 * 60))
+    now = int(time.time())
+    expires_at = now + ttl_seconds
+    token = secrets.token_urlsafe(32)
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (now,))
+        conn.execute(
+            "INSERT INTO auth_sessions (token_hash, user_id, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?)",
+            (_token_hash(token), user_id, now, expires_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return token, expires_at
+
+
+def authenticate_token(token):
+    if not isinstance(token, str) or not token:
+        return None
+    now = int(time.time())
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT s.user_id, u.username, s.expires_at "
+            "FROM auth_sessions s JOIN users u ON u.id = s.user_id "
+            "WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?",
+            (_token_hash(token), now),
+        ).fetchone()
+        if not row:
+            return None
+        return {"user_id": row[0], "username": row[1], "expires_at": row[2]}
+    finally:
+        conn.close()
+
+
+def revoke_auth_session(token):
+    if not isinstance(token, str) or not token:
+        return False
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            "UPDATE auth_sessions SET revoked_at = ? "
+            "WHERE token_hash = ? AND revoked_at IS NULL",
+            (int(time.time()), _token_hash(token)),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
 
 def get_settings(user_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     c = conn.cursor()
     c.execute("SELECT settings FROM users WHERE id = ?", (user_id,))
     res = c.fetchone()
     conn.close()
-    return json.loads(res[0]) if res and res[0] else {}
+    if not res or not res[0]:
+        return {}
+    try:
+        settings = json.loads(res[0])
+        return settings if isinstance(settings, dict) else {}
+    except (TypeError, json.JSONDecodeError):
+        return {}
 
 def update_settings(user_id, settings):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     c = conn.cursor()
     c.execute("UPDATE users SET settings = ? WHERE id = ?", (json.dumps(settings), user_id))
+    if c.rowcount == 0:
+        conn.rollback()
+        conn.close()
+        return False
     conn.commit()
     conn.close()
+    return True
 
 def get_portfolio(user_id):
     str_uid = normalize_user_id(user_id)
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     c = conn.cursor()
     c.execute("SELECT id, name, symbol, quantity, buy_price FROM portfolio WHERE user_id = ?", (str_uid,))
     res = [{'id': r[0], 'name': r[1], 'symbol': r[2], 'quantity': r[3], 'buy_price': r[4]} for r in c.fetchall()]
@@ -122,27 +321,40 @@ def get_portfolio(user_id):
 
 def add_portfolio(user_id, name, symbol, quantity, buy_price):
     str_uid = normalize_user_id(user_id)
-    qty = float(quantity)
-    px = float(buy_price)
-    conn = sqlite3.connect(DB_PATH)
+    symbol = _canonical_symbol(symbol)
+    qty = _finite_positive(quantity, "Quantity")
+    px = _finite_positive(buy_price, "Buy price")
+    clean_name = str(name).strip() if name is not None else ""
+    clean_name = clean_name[:200] or symbol
+    conn = _connect()
     c = conn.cursor()
-    c.execute("SELECT id, quantity, buy_price FROM portfolio WHERE user_id = ? AND symbol = ?", (str_uid, symbol))
-    existing = c.fetchone()
-    if existing:
-        exist_id, exist_qty, exist_px = existing
-        new_qty = exist_qty + qty
-        new_avg_px = round(((exist_qty * exist_px) + (qty * px)) / new_qty, 2)
-        c.execute("UPDATE portfolio SET quantity = ?, buy_price = ?, name = ? WHERE id = ?",
-                  (new_qty, new_avg_px, name or symbol, exist_id))
-    else:
-        c.execute("INSERT INTO portfolio (user_id, name, symbol, quantity, buy_price) VALUES (?, ?, ?, ?, ?)",
-                  (str_uid, name or symbol, symbol, qty, px))
-    conn.commit()
-    conn.close()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute(
+            "SELECT id, quantity, buy_price FROM portfolio "
+            "WHERE user_id = ? AND symbol = ? COLLATE NOCASE",
+            (str_uid, symbol),
+        )
+        existing = c.fetchone()
+        if existing:
+            exist_id, exist_qty, exist_px = existing
+            new_qty = exist_qty + qty
+            new_avg_px = round(((exist_qty * exist_px) + (qty * px)) / new_qty, 2)
+            c.execute("UPDATE portfolio SET symbol = ?, quantity = ?, buy_price = ?, name = ? WHERE id = ?",
+                      (symbol, new_qty, new_avg_px, clean_name, exist_id))
+        else:
+            c.execute("INSERT INTO portfolio (user_id, name, symbol, quantity, buy_price) VALUES (?, ?, ?, ?, ?)",
+                      (str_uid, clean_name, symbol, qty, px))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def remove_portfolio(pid, user_id):
     str_uid = normalize_user_id(user_id)
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     c = conn.cursor()
     c.execute("DELETE FROM portfolio WHERE id = ? AND user_id = ?", (pid, str_uid))
     deleted = c.rowcount > 0
@@ -152,7 +364,7 @@ def remove_portfolio(pid, user_id):
 
 def get_watchlist(user_id):
     str_uid = normalize_user_id(user_id)
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     c = conn.cursor()
     c.execute("SELECT id, name, symbol, alert_price, alert_dir FROM watchlist WHERE user_id = ?", (str_uid,))
     res = [{'id': r[0], 'name': r[1], 'symbol': r[2], 'alert_price': r[3], 'alert_dir': r[4]} for r in c.fetchall()]
@@ -161,16 +373,27 @@ def get_watchlist(user_id):
 
 def add_watchlist(user_id, name, symbol, alert_price, alert_dir='below'):
     str_uid = normalize_user_id(user_id)
-    conn = sqlite3.connect(DB_PATH)
+    symbol = _canonical_symbol(symbol)
+    clean_name = str(name).strip()[:200] if name is not None else ""
+    try:
+        alert_price = float(alert_price)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("Alert price must be a number.")
+    if not math.isfinite(alert_price) or alert_price < 0:
+        raise ValueError("Alert price must be a finite, non-negative number.")
+    alert_dir = str(alert_dir).strip().lower()
+    if alert_dir not in {"above", "below"}:
+        raise ValueError("Alert direction must be 'above' or 'below'.")
+    conn = _connect()
     c = conn.cursor()
     c.execute("INSERT INTO watchlist (user_id, name, symbol, alert_price, alert_dir) VALUES (?, ?, ?, ?, ?)",
-              (str_uid, name, symbol, alert_price, alert_dir))
+              (str_uid, clean_name or symbol, symbol, alert_price, alert_dir))
     conn.commit()
     conn.close()
 
 def remove_watchlist(wid, user_id):
     str_uid = normalize_user_id(user_id)
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     c = conn.cursor()
     c.execute("DELETE FROM watchlist WHERE id = ? AND user_id = ?", (wid, str_uid))
     deleted = c.rowcount > 0
@@ -179,150 +402,193 @@ def remove_watchlist(wid, user_id):
     return deleted
 
 def is_in_watchlist(user_id, symbol):
-    conn = sqlite3.connect(DB_PATH)
+    symbol = _canonical_symbol(symbol)
+    conn = _connect()
     c = conn.cursor()
-    c.execute("SELECT id FROM watchlist WHERE user_id = ? AND symbol = ?", (str(user_id), str(symbol)))
+    c.execute("SELECT id FROM watchlist WHERE user_id = ? AND symbol = ? COLLATE NOCASE", (normalize_user_id(user_id), symbol))
     row = c.fetchone()
     conn.close()
     return bool(row)
 
 def toggle_watchlist(user_id, name, symbol, alert_price=0.0, alert_dir='below'):
-    conn = sqlite3.connect(DB_PATH)
+    str_uid = normalize_user_id(user_id)
+    symbol = _canonical_symbol(symbol)
+    clean_name = str(name).strip()[:200] if name is not None else ""
+    conn = _connect()
     c = conn.cursor()
-    c.execute("SELECT id FROM watchlist WHERE user_id = ? AND symbol = ?", (str(user_id), str(symbol)))
-    row = c.fetchone()
-    if row:
-        c.execute("DELETE FROM watchlist WHERE id = ?", (row[0],))
-        added = False
-    else:
-        clean_name = name or symbol
-        c.execute("INSERT INTO watchlist (user_id, name, symbol, alert_price, alert_dir) VALUES (?, ?, ?, ?, ?)",
-                  (str(user_id), clean_name, str(symbol), alert_price, alert_dir))
-        added = True
-    conn.commit()
-    conn.close()
-    return {"is_in_watchlist": added}
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute(
+            "SELECT id FROM watchlist WHERE user_id = ? AND symbol = ? COLLATE NOCASE",
+            (str_uid, symbol),
+        )
+        row = c.fetchone()
+        if row:
+            c.execute("DELETE FROM watchlist WHERE id = ? AND user_id = ?", (row[0], str_uid))
+            added = False
+        else:
+            c.execute("INSERT INTO watchlist (user_id, name, symbol, alert_price, alert_dir) VALUES (?, ?, ?, ?, ?)",
+                      (str_uid, clean_name or symbol, symbol, alert_price, alert_dir))
+            added = True
+        conn.commit()
+        return {"is_in_watchlist": added}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def get_virtual_cash(user_id, cursor=None):
     if is_guest(user_id):
-        return 1000000.0
+        return DEFAULT_VIRTUAL_CASH
     if cursor is not None:
         cursor.execute("SELECT virtual_cash FROM users WHERE id = ?", (user_id,))
         row = cursor.fetchone()
         if row and row[0] is not None:
             return float(row[0])
-        return 1000000.0
-    conn = sqlite3.connect(DB_PATH)
+        return DEFAULT_VIRTUAL_CASH
+    conn = _connect()
     c = conn.cursor()
     c.execute("SELECT virtual_cash FROM users WHERE id = ?", (user_id,))
     row = c.fetchone()
     conn.close()
     if row and row[0] is not None:
         return float(row[0])
-    return 1000000.0
+    return DEFAULT_VIRTUAL_CASH
+
+def get_paper_positions(user_id):
+    str_uid = normalize_user_id(user_id)
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, name, symbol, quantity, buy_price "
+            "FROM paper_positions WHERE user_id = ? ORDER BY id",
+            (str_uid,),
+        ).fetchall()
+        return [
+            {"id": row[0], "name": row[1], "symbol": row[2], "quantity": row[3], "buy_price": row[4]}
+            for row in rows
+        ]
+    finally:
+        conn.close()
 
 def execute_trade(user_id, symbol, name, order_type, quantity, price):
     """
     Executes a virtual BUY or SELL order atomically.
     Validates virtual cash balance and stock quantities.
-    Updates portfolio average buy price and position quantity.
+    Updates the isolated paper-position ledger and average entry price.
     """
     if is_guest(user_id):
         return {"error": "Please sign in to use paper trading."}
 
     try:
-        qty = float(quantity)
-        px = float(price)
-        if qty <= 0 or px <= 0:
-            return {"error": "Quantity and Price must be greater than zero."}
+        qty = _finite_positive(quantity, "Quantity")
+        px = _finite_positive(price, "Price")
+        symbol = _canonical_symbol(symbol)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
-        str_uid = normalize_user_id(user_id)
-        total_amount = round(qty * px, 2)
-        order_type_upper = order_type.upper()
+    order_type_upper = str(order_type).strip().upper()
+    if order_type_upper not in {"BUY", "SELL"}:
+        return {"error": "Invalid order type. Must be BUY or SELL."}
+    total_amount = round(qty * px, 2)
+    if not math.isfinite(total_amount) or total_amount <= 0:
+        return {"error": "Order amount must be finite and greater than zero."}
 
-        conn = sqlite3.connect(DB_PATH)
+    str_uid = normalize_user_id(user_id)
+    clean_name = (str(name).strip() if name is not None else "")[:200] or symbol
+    conn = _connect()
+    try:
         c = conn.cursor()
         c.execute("BEGIN IMMEDIATE")
-
         c.execute("SELECT virtual_cash FROM users WHERE id = ?", (user_id,))
         cash_row = c.fetchone()
         if not cash_row:
             conn.rollback()
-            conn.close()
             return {"error": "User not found."}
-        current_cash = float(cash_row[0]) if cash_row[0] is not None else 1000000.0
+        current_cash = float(cash_row[0]) if cash_row[0] is not None else DEFAULT_VIRTUAL_CASH
+        if not math.isfinite(current_cash) or current_cash < 0:
+            conn.rollback()
+            return {"error": "Paper trading balance is invalid. Please contact support."}
 
-        if order_type_upper == 'BUY':
-            if current_cash < total_amount:
+        c.execute(
+            "SELECT id, quantity, buy_price FROM paper_positions "
+            "WHERE user_id = ? AND symbol = ? COLLATE NOCASE",
+            (str_uid, symbol),
+        )
+        existing = c.fetchone()
+
+        if order_type_upper == "BUY":
+            if current_cash + 1e-9 < total_amount:
                 conn.rollback()
-                conn.close()
-                return {"error": f"Insufficient virtual cash! Required: ₹{total_amount:,.2f}, Available: ₹{current_cash:,.2f}"}
-
-            c.execute("SELECT id, quantity, buy_price FROM portfolio WHERE user_id = ? AND symbol = ?", (str_uid, symbol))
-            existing = c.fetchone()
-
+                return {
+                    "error": f"Insufficient virtual cash. Required: INR {total_amount:,.2f}, "
+                             f"Available: INR {current_cash:,.2f}"
+                }
             if existing:
                 exist_id, exist_qty, exist_px = existing
                 new_qty = exist_qty + qty
-                new_avg_px = round(((exist_qty * exist_px) + (qty * px)) / new_qty, 2)
-                c.execute("UPDATE portfolio SET quantity = ?, buy_price = ?, name = ? WHERE id = ?",
-                          (new_qty, new_avg_px, name or symbol, exist_id))
+                new_avg_px = round(((exist_qty * exist_px) + (qty * px)) / new_qty, 4)
+                c.execute(
+                    "UPDATE paper_positions SET symbol = ?, quantity = ?, buy_price = ?, name = ? "
+                    "WHERE id = ? AND user_id = ?",
+                    (symbol, new_qty, new_avg_px, clean_name, exist_id, str_uid),
+                )
             else:
-                c.execute("INSERT INTO portfolio (user_id, name, symbol, quantity, buy_price) VALUES (?, ?, ?, ?, ?)",
-                          (str_uid, name or symbol, symbol, qty, px))
-
+                new_qty = qty
+                c.execute(
+                    "INSERT INTO paper_positions (user_id, name, symbol, quantity, buy_price) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (str_uid, clean_name, symbol, qty, px),
+                )
             new_cash = round(current_cash - total_amount, 2)
-            c.execute("UPDATE users SET virtual_cash = ? WHERE id = ?", (new_cash, user_id))
-
-        elif order_type_upper == 'SELL':
-            c.execute("SELECT id, quantity, buy_price FROM portfolio WHERE user_id = ? AND symbol = ?", (str_uid, symbol))
-            existing = c.fetchone()
-
-            if not existing or existing[1] < qty:
-                conn.rollback()
-                conn.close()
-                held_qty = existing[1] if existing else 0
-                return {"error": f"Cannot sell {qty} shares. You currently hold {held_qty} shares of {symbol}."}
-
-            exist_id, exist_qty, exist_px = existing
-            if exist_qty == qty:
-                c.execute("DELETE FROM portfolio WHERE id = ?", (exist_id,))
-            else:
-                new_qty = exist_qty - qty
-                c.execute("UPDATE portfolio SET quantity = ? WHERE id = ?", (new_qty, exist_id))
-
-            new_cash = round(current_cash + total_amount, 2)
-            c.execute("UPDATE users SET virtual_cash = ? WHERE id = ?", (new_cash, user_id))
         else:
-            conn.rollback()
-            conn.close()
-            return {"error": "Invalid order type. Must be BUY or SELL."}
+            held_qty = float(existing[1]) if existing else 0.0
+            if not existing or held_qty + 1e-9 < qty:
+                conn.rollback()
+                return {"error": f"Cannot sell {qty} shares. You currently hold {held_qty} shares of {symbol}."}
+            exist_id = existing[0]
+            remaining = held_qty - qty
+            if remaining <= 1e-9:
+                c.execute("DELETE FROM paper_positions WHERE id = ? AND user_id = ?", (exist_id, str_uid))
+                new_qty = 0.0
+            else:
+                new_qty = remaining
+                c.execute(
+                    "UPDATE paper_positions SET quantity = ? WHERE id = ? AND user_id = ?",
+                    (remaining, exist_id, str_uid),
+                )
+            new_cash = round(current_cash + total_amount, 2)
 
-        from datetime import datetime
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        c.execute("INSERT INTO transactions (user_id, symbol, name, order_type, quantity, price, total_amount, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                  (str_uid, symbol, name or symbol, order_type_upper, qty, px, total_amount, now_str))
-
+        c.execute("UPDATE users SET virtual_cash = ? WHERE id = ?", (new_cash, user_id))
+        now_str = datetime.now(timezone.utc).isoformat()
+        c.execute(
+            "INSERT INTO transactions "
+            "(user_id, symbol, name, order_type, quantity, price, total_amount, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (str_uid, symbol, clean_name, order_type_upper, qty, px, total_amount, now_str),
+        )
         conn.commit()
+        return {
+            "status": "ok",
+            "message": f"{order_type_upper} order of {qty} shares of {symbol} executed at INR {px:.2f}.",
+            "virtual_cash": new_cash,
+            "position_quantity": new_qty,
+        }
+    except sqlite3.Error:
+        conn.rollback()
+        return {"error": "Paper trade could not be completed. Please retry."}
+    finally:
         conn.close()
-        return {"status": "ok", "message": f"{order_type_upper} order of {qty} shares of {symbol} executed at ₹{px:.2f}."}
-
-    except Exception as e:
-        try:
-            conn.rollback()
-            conn.close()
-        except Exception:
-            pass
-        return {"error": str(e)}
 
 def get_trading_summary(user_id):
     if is_guest(user_id):
         return {"virtual_cash": 0, "portfolio": [], "transactions": []}
     str_uid = normalize_user_id(user_id)
     cash = get_virtual_cash(user_id)
-    portfolio = get_portfolio(str_uid)
+    portfolio = get_paper_positions(str_uid)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     c = conn.cursor()
     c.execute("SELECT id, symbol, name, order_type, quantity, price, total_amount, timestamp FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 20", (str_uid,))
     txs = [{'id': r[0], 'symbol': r[1], 'name': r[2], 'order_type': r[3], 'quantity': r[4], 'price': r[5], 'total_amount': r[6], 'timestamp': r[7]} for r in c.fetchall()]
@@ -334,38 +600,75 @@ def get_trading_summary(user_id):
         "transactions": txs
     }
 
-def save_ai_session(session):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''INSERT OR REPLACE INTO ai_sessions 
-                 (id, user_id, symbol, start_time, end_time, starting_capital, ending_capital,
-                  status, realized_pnl, trade_count, analytics_json, trades_json, decisions_json, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-              (session.get('id'), normalize_user_id(session.get('user_id', 'guest')),
-               session.get('symbol', '').upper(), session.get('start_time', ''), session.get('end_time', ''),
-               float(session.get('starting_capital', 100000.0)), float(session.get('ending_capital', 100000.0)),
-               session.get('status', 'COMPLETED'), float(session.get('realized_pnl', 0.0)),
-               int(session.get('trade_count', 0)), json.dumps(session.get('analytics', {})),
-               json.dumps(session.get('trades', [])), json.dumps(session.get('decisions', [])),
-               session.get('created_at', '')))
-    conn.commit()
-    conn.close()
-    return session.get('id')
+def save_ai_session(session, user_id):
+    """Create/update a session without allowing its owner to be replaced."""
+    session_id = str(session.get("id", "")).strip()
+    if not session_id or len(session_id) > 128:
+        raise ValueError("Invalid session id.")
+    str_uid = normalize_user_id(user_id)
+    symbol = _canonical_symbol(session.get("symbol", ""))
+    starting_capital = float(session.get("starting_capital", 100000.0))
+    ending_capital = float(session.get("ending_capital", 100000.0))
+    realized_pnl = float(session.get("realized_pnl", 0.0))
+    if not all(math.isfinite(v) for v in (starting_capital, ending_capital, realized_pnl)):
+        raise ValueError("Session monetary values must be finite.")
+    if starting_capital < 0 or ending_capital < 0:
+        raise ValueError("Session capital cannot be negative.")
+    trade_count = int(session.get("trade_count", 0))
+    if trade_count < 0:
+        raise ValueError("Trade count cannot be negative.")
 
-def get_ai_sessions(user_id=None, symbol=None, limit=50):
-    conn = sqlite3.connect(DB_PATH)
+    analytics_json = json.dumps(session.get("analytics") or {}, allow_nan=False)
+    trades_json = json.dumps(session.get("trades") or [], allow_nan=False)
+    decisions_json = json.dumps(session.get("decisions") or [], allow_nan=False)
+    status = str(session.get("status") or "COMPLETED").strip().upper()[:40]
+    created_at = str(session.get("created_at") or datetime.now(timezone.utc).isoformat())[:64]
+    values = (
+        session_id, str_uid, symbol, str(session.get("start_time") or "")[:64],
+        str(session.get("end_time") or "")[:64], starting_capital, ending_capital,
+        status, realized_pnl, trade_count, analytics_json, trades_json,
+        decisions_json, created_at,
+    )
+
+    conn = _connect()
+    try:
+        c = conn.cursor()
+        c.execute("BEGIN IMMEDIATE")
+        existing = c.execute("SELECT user_id FROM ai_sessions WHERE id = ?", (session_id,)).fetchone()
+        if existing and existing[0] != str_uid:
+            conn.rollback()
+            raise PermissionError("Session belongs to another user.")
+        c.execute('''INSERT INTO ai_sessions
+                     (id, user_id, symbol, start_time, end_time, starting_capital, ending_capital,
+                      status, realized_pnl, trade_count, analytics_json, trades_json, decisions_json, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(id) DO UPDATE SET
+                       symbol = excluded.symbol, start_time = excluded.start_time,
+                       end_time = excluded.end_time, starting_capital = excluded.starting_capital,
+                       ending_capital = excluded.ending_capital, status = excluded.status,
+                       realized_pnl = excluded.realized_pnl, trade_count = excluded.trade_count,
+                       analytics_json = excluded.analytics_json, trades_json = excluded.trades_json,
+                       decisions_json = excluded.decisions_json, created_at = excluded.created_at''', values)
+        conn.commit()
+        return session_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def get_ai_sessions(user_id, symbol=None, limit=50):
+    str_uid = normalize_user_id(user_id)
+    limit = max(1, min(int(limit), 100))
+    conn = _connect()
     c = conn.cursor()
     query = "SELECT id, user_id, symbol, start_time, end_time, starting_capital, ending_capital, status, realized_pnl, trade_count, analytics_json, created_at FROM ai_sessions"
-    params = []
-    conditions = []
-    if user_id and str(user_id) != 'guest':
-        conditions.append("user_id = ?")
-        params.append(normalize_user_id(user_id))
+    params = [str_uid]
+    conditions = ["user_id = ?"]
     if symbol:
         conditions.append("symbol = ?")
-        params.append(symbol.upper())
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
+        params.append(_canonical_symbol(symbol))
+    query += " WHERE " + " AND ".join(conditions)
     query += " ORDER BY created_at DESC LIMIT ?"
     params.append(limit)
 
@@ -377,8 +680,11 @@ def get_ai_sessions(user_id=None, symbol=None, limit=50):
     for r in rows:
         analytics = {}
         try:
-            if r[10]: analytics = json.loads(r[10])
-        except: pass
+            if r[10]:
+                parsed = json.loads(r[10])
+                analytics = parsed if isinstance(parsed, dict) else {}
+        except (TypeError, json.JSONDecodeError):
+            pass
         sessions.append({
             'id': r[0],
             'user_id': r[1],
@@ -395,20 +701,27 @@ def get_ai_sessions(user_id=None, symbol=None, limit=50):
         })
     return sessions
 
-def get_ai_session(session_id):
-    conn = sqlite3.connect(DB_PATH)
+def get_ai_session(session_id, user_id):
+    conn = _connect()
     c = conn.cursor()
-    c.execute("SELECT id, user_id, symbol, start_time, end_time, starting_capital, ending_capital, status, realized_pnl, trade_count, analytics_json, trades_json, decisions_json, created_at FROM ai_sessions WHERE id = ?", (session_id,))
+    c.execute("SELECT id, user_id, symbol, start_time, end_time, starting_capital, ending_capital, status, realized_pnl, trade_count, analytics_json, trades_json, decisions_json, created_at FROM ai_sessions WHERE id = ? AND user_id = ?", (session_id, normalize_user_id(user_id)))
     r = c.fetchone()
     conn.close()
-    if not r: return None
+    if not r:
+        return None
 
-    try: analytics = json.loads(r[10]) if r[10] else {}
-    except: analytics = {}
-    try: trades = json.loads(r[11]) if r[11] else []
-    except: trades = []
-    try: decisions = json.loads(r[12]) if r[12] else []
-    except: decisions = []
+    try:
+        analytics = json.loads(r[10]) if r[10] else {}
+        if not isinstance(analytics, dict): analytics = {}
+    except (TypeError, json.JSONDecodeError): analytics = {}
+    try:
+        trades = json.loads(r[11]) if r[11] else []
+        if not isinstance(trades, list): trades = []
+    except (TypeError, json.JSONDecodeError): trades = []
+    try:
+        decisions = json.loads(r[12]) if r[12] else []
+        if not isinstance(decisions, list): decisions = []
+    except (TypeError, json.JSONDecodeError): decisions = []
 
     return {
         'id': r[0],

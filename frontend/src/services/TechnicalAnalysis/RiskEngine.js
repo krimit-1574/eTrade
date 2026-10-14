@@ -52,33 +52,109 @@ export const REJECTION_CODES = {
   STALE_DATA: 'STALE_DATA',
 };
 
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+function asFiniteNumber(value) {
+  const number = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizeSymbol(symbol) {
+  return typeof symbol === 'string'
+    ? symbol.trim().toUpperCase().replace(/\.NS$/i, '')
+    : '';
+}
+
+function normalizeRiskSettings(settings = {}) {
+  const merged = { ...DEFAULT_RISK_SETTINGS, ...(settings || {}) };
+  const ranges = {
+    paperCapital: [0.01, Number.MAX_SAFE_INTEGER],
+    maxRiskPerTradePct: [0, 100],
+    maxCapitalPerTradePct: [0, 100],
+    maxDailyLoss: [0, Number.MAX_SAFE_INTEGER],
+    maxSimultaneousPositions: [0, 100],
+    maxTotalExposurePct: [0, 100],
+    maxTradesPerStock: [0, 10000],
+    maxTradesPerDay: [0, 10000],
+    maxConsecutiveLosses: [0, 10000],
+    cooldownMinutes: [0, 24 * 60],
+    minAiConfidence: [0, 100],
+    minRiskReward: [0, 1000],
+  };
+
+  for (const [key, [minimum, maximum]] of Object.entries(ranges)) {
+    const parsed = asFiniteNumber(merged[key]);
+    const fallback = DEFAULT_RISK_SETTINGS[key];
+    merged[key] = parsed === null || parsed < minimum || parsed > maximum ? fallback : parsed;
+  }
+
+  for (const key of ['maxSimultaneousPositions', 'maxTradesPerStock', 'maxTradesPerDay', 'maxConsecutiveLosses']) {
+    merged[key] = Math.floor(merged[key]);
+  }
+
+  merged.bypassMarketHours = merged.bypassMarketHours === true;
+  merged.bypassCutoff = merged.bypassCutoff === true;
+  return merged;
+}
+
+function parseClockMinutes(value, fallback) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(typeof value === 'string' ? value.trim() : '');
+  if (!match) return parseClockMinutes(fallback, '00:00');
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return parseClockMinutes(fallback, '00:00');
+  return hours * 60 + minutes;
+}
+
+function getIstParts(value = null) {
+  const date = value === null || value === undefined ? new Date() : new Date(value);
+  const timestamp = date.getTime();
+  if (!Number.isFinite(timestamp)) return null;
+
+  const ist = new Date(timestamp + IST_OFFSET_MS);
+  return {
+    timestamp,
+    day: ist.getUTCDay(),
+    minutes: ist.getUTCHours() * 60 + ist.getUTCMinutes(),
+    dateKey: `${ist.getUTCFullYear()}-${String(ist.getUTCMonth() + 1).padStart(2, '0')}-${String(ist.getUTCDate()).padStart(2, '0')}`,
+  };
+}
+
+function isTradeFromDate(record, dateKey) {
+  const timestamp = record?.exitTime || record?.entryTime || record?.filledAt || record?.createdAt;
+  if (!timestamp) return true; // Preserve legacy/session-only records that predate timestamps.
+  return getIstParts(timestamp)?.dateKey === dateKey;
+}
+
 export const RiskEngine = {
   /**
    * Loads risk configuration from storage or returns defaults.
    */
   loadSettings() {
     try {
-      const stored = localStorage.getItem(STORAGE_KEY);
+      const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null;
       if (stored) {
-        return { ...DEFAULT_RISK_SETTINGS, ...JSON.parse(stored) };
+        return normalizeRiskSettings(JSON.parse(stored));
       }
     } catch (e) {
       console.warn('RiskEngine: Failed to read from localStorage', e);
     }
-    return { ...DEFAULT_RISK_SETTINGS };
+    return normalizeRiskSettings();
   },
 
   /**
    * Persists updated risk settings.
    */
   saveSettings(settings) {
+    const merged = normalizeRiskSettings(settings);
     try {
-      const merged = { ...DEFAULT_RISK_SETTINGS, ...settings };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+      }
       return merged;
     } catch (e) {
       console.warn('RiskEngine: Failed to save to localStorage', e);
-      return { ...DEFAULT_RISK_SETTINGS, ...settings };
+      return merged;
     }
   },
 
@@ -87,9 +163,9 @@ export const RiskEngine = {
    */
   resetSettings() {
     try {
-      localStorage.removeItem(STORAGE_KEY);
+      if (typeof localStorage !== 'undefined') localStorage.removeItem(STORAGE_KEY);
     } catch (_) {}
-    return { ...DEFAULT_RISK_SETTINGS };
+    return normalizeRiskSettings();
   },
 
   /**
@@ -97,58 +173,70 @@ export const RiskEngine = {
    * Combines ATR volatility multiplier and swing highs/lows or support/resistance.
    */
   calculateStructuralStopLoss({ entry, direction, atr, support, resistance, recentCandles = [] }) {
-    if (!entry || entry <= 0) return null;
-    const safeAtr = atr && atr > 0 ? atr : entry * 0.008; // Fallback 0.8% ATR if unavailable
+    const safeEntry = asFiniteNumber(entry);
+    if (safeEntry === null || safeEntry <= 0 || (direction !== 'LONG' && direction !== 'SHORT')) return null;
+
+    const parsedAtr = asFiniteNumber(atr);
+    const safeAtr = parsedAtr !== null && parsedAtr > 0 ? parsedAtr : safeEntry * 0.008;
+    const candles = Array.isArray(recentCandles) ? recentCandles : [];
+    const safeSupport = asFiniteNumber(support);
+    const safeResistance = asFiniteNumber(resistance);
 
     if (direction === 'LONG') {
       // 1. Base ATR Stop
-      let stopLoss = entry - (safeAtr * 1.5);
+      let stopLoss = safeEntry - (safeAtr * 1.5);
 
       // 2. Recent swing low / support anchor
-      if (support && support < entry) {
-        const supportBuffer = support * 0.998; // 0.2% below support
+      if (safeSupport !== null && safeSupport > 0 && safeSupport < safeEntry) {
+        const supportBuffer = safeSupport * 0.998; // 0.2% below support
         // Choose the tighter structural level that is at least 0.3% away
-        if (entry - supportBuffer >= entry * 0.003 && entry - supportBuffer <= entry * 0.03) {
+        if (safeEntry - supportBuffer >= safeEntry * 0.003 && safeEntry - supportBuffer <= safeEntry * 0.03) {
           stopLoss = Math.max(stopLoss, supportBuffer);
         }
       }
 
       // 3. Lowest low of last 3-5 candles if available
-      if (recentCandles.length >= 3) {
-        const lowestLow = Math.min(...recentCandles.slice(-5).map(c => parseFloat(c.low || c.close)));
-        if (lowestLow < entry && entry - lowestLow <= entry * 0.03) {
+      if (candles.length >= 3) {
+        const lows = candles.slice(-5)
+          .map(c => asFiniteNumber(c?.low ?? c?.close))
+          .filter(value => value !== null && value > 0);
+        const lowestLow = lows.length > 0 ? Math.min(...lows) : null;
+        if (lowestLow !== null && lowestLow < safeEntry && safeEntry - lowestLow <= safeEntry * 0.03) {
           stopLoss = Math.max(stopLoss, lowestLow * 0.999);
         }
       }
 
       // Hard cap: maximum 3% stop loss distance, minimum 0.2%
-      if (entry - stopLoss > entry * 0.03) stopLoss = entry * 0.97;
-      if (entry - stopLoss < entry * 0.002) stopLoss = entry * 0.998;
-
-      return parseFloat(stopLoss.toFixed(2));
-    } else {
-      // SHORT
-      let stopLoss = entry + (safeAtr * 1.5);
-
-      if (resistance && resistance > entry) {
-        const resistanceBuffer = resistance * 1.002;
-        if (resistanceBuffer - entry >= entry * 0.003 && resistanceBuffer - entry <= entry * 0.03) {
-          stopLoss = Math.min(stopLoss, resistanceBuffer);
-        }
-      }
-
-      if (recentCandles.length >= 3) {
-        const highestHigh = Math.max(...recentCandles.slice(-5).map(c => parseFloat(c.high || c.close)));
-        if (highestHigh > entry && highestHigh - entry <= entry * 0.03) {
-          stopLoss = Math.min(stopLoss, highestHigh * 1.001);
-        }
-      }
-
-      if (stopLoss - entry > entry * 0.03) stopLoss = entry * 1.03;
-      if (stopLoss - entry < entry * 0.002) stopLoss = entry * 1.002;
+      if (safeEntry - stopLoss > safeEntry * 0.03) stopLoss = safeEntry * 0.97;
+      if (safeEntry - stopLoss < safeEntry * 0.002) stopLoss = safeEntry * 0.998;
 
       return parseFloat(stopLoss.toFixed(2));
     }
+
+    // SHORT
+    let stopLoss = safeEntry + (safeAtr * 1.5);
+
+    if (safeResistance !== null && safeResistance > safeEntry) {
+      const resistanceBuffer = safeResistance * 1.002;
+      if (resistanceBuffer - safeEntry >= safeEntry * 0.003 && resistanceBuffer - safeEntry <= safeEntry * 0.03) {
+        stopLoss = Math.min(stopLoss, resistanceBuffer);
+      }
+    }
+
+    if (candles.length >= 3) {
+      const highs = candles.slice(-5)
+        .map(c => asFiniteNumber(c?.high ?? c?.close))
+        .filter(value => value !== null && value > 0);
+      const highestHigh = highs.length > 0 ? Math.max(...highs) : null;
+      if (highestHigh !== null && highestHigh > safeEntry && highestHigh - safeEntry <= safeEntry * 0.03) {
+        stopLoss = Math.min(stopLoss, highestHigh * 1.001);
+      }
+    }
+
+    if (stopLoss - safeEntry > safeEntry * 0.03) stopLoss = safeEntry * 1.03;
+    if (stopLoss - safeEntry < safeEntry * 0.002) stopLoss = safeEntry * 1.002;
+
+    return parseFloat(stopLoss.toFixed(2));
   },
 
   /**
@@ -162,20 +250,35 @@ export const RiskEngine = {
    * - Maximum capital per trade allocation
    * - Commission buffer
    */
-  calculatePositionSize({ accountValue, availableCash, entryPrice, stopLoss, settings }) {
-    const config = settings || this.loadSettings();
-    if (!entryPrice || entryPrice <= 0 || !stopLoss || entryPrice === stopLoss) {
+  calculatePositionSize({ accountValue, availableCash, entryPrice, stopLoss, settings, currentExposure = 0 } = {}) {
+    const config = normalizeRiskSettings(settings || this.loadSettings());
+    const entry = asFiniteNumber(entryPrice);
+    const stop = asFiniteNumber(stopLoss);
+    const equity = asFiniteNumber(accountValue);
+    const available = asFiniteNumber(availableCash);
+    const exposureValue = asFiniteNumber(currentExposure);
+
+    if (entry === null || entry <= 0 || stop === null || stop <= 0 || entry === stop) {
       return { quantity: 0, riskAmount: 0, capitalRequired: 0, constrainedBy: 'INVALID_PRICES' };
     }
 
-    const totalEquity = accountValue && accountValue > 0 ? accountValue : (availableCash || 100000);
-    const cash = availableCash && availableCash > 0 ? availableCash : totalEquity;
+    // Missing account values must fail closed. A literal zero cash balance must never
+    // fall back to the account equity and manufacture buying power.
+    const totalEquity = equity !== null && equity > 0
+      ? equity
+      : (available !== null && available > 0 ? available : 0);
+    const cash = available !== null ? Math.max(0, available) : totalEquity;
+    const exposure = exposureValue !== null ? Math.max(0, exposureValue) : 0;
+
+    if (totalEquity <= 0 || cash <= 0) {
+      return { quantity: 0, riskAmount: 0, actualRisk: 0, capitalRequired: 0, constrainedBy: 'AVAILABLE_CASH', remainingExposure: 0 };
+    }
 
     // 1. Calculate nominal monetary risk allowance
     const riskAmount = totalEquity * (config.maxRiskPerTradePct / 100);
 
     // 2. Per-share risk distance
-    const perShareRisk = Math.abs(entryPrice - stopLoss);
+    const perShareRisk = Math.abs(entry - stop);
     if (perShareRisk <= 0) {
       return { quantity: 0, riskAmount: 0, capitalRequired: 0, constrainedBy: 'ZERO_PER_SHARE_RISK' };
     }
@@ -185,27 +288,33 @@ export const RiskEngine = {
 
     // 4. Maximum capital allocation constraint
     const maxCapitalAllowed = totalEquity * (config.maxCapitalPerTradePct / 100);
-    const maxAffordableByAllocation = Math.floor(maxCapitalAllowed / entryPrice);
+    const maxAffordableByAllocation = Math.floor(maxCapitalAllowed / entry);
 
     // 5. Total exposure constraint (Rule: maxTotalExposurePct, e.g. 80%)
-    const maxTotalExposurePct = config.maxTotalExposurePct !== undefined ? config.maxTotalExposurePct : 80;
-    const remainingExposure = Math.max(0, (totalEquity * maxTotalExposurePct / 100) - currentExposure);
-    const maxAffordableByExposure = Math.floor(remainingExposure / entryPrice);
+    const maxTotalExposurePct = config.maxTotalExposurePct;
+    const remainingExposure = Math.max(0, (totalEquity * maxTotalExposurePct / 100) - exposure);
+    const maxAffordableByExposure = Math.floor(remainingExposure / entry);
 
     // 6. Hard cash constraint (leaving ₹50 buffer for fees & slippage)
-    const maxAffordableByCash = Math.floor(Math.max(0, cash - 50) / (entryPrice * 1.002));
+    const maxAffordableByCash = Math.floor(Math.max(0, cash - 50) / (entry * 1.002));
 
     // 7. Constrain quantity
     let quantity = Math.min(rawQty, maxAffordableByAllocation, maxAffordableByExposure, maxAffordableByCash);
     quantity = Math.max(0, quantity);
 
-    const capitalRequired = parseFloat((quantity * entryPrice).toFixed(2));
+    const capitalRequired = parseFloat((quantity * entry).toFixed(2));
     const actualRisk = parseFloat((quantity * perShareRisk).toFixed(2));
 
     let constrainedBy = 'RISK_FORMULA';
-    if (quantity === maxAffordableByAllocation && quantity < rawQty) constrainedBy = 'MAX_CAPITAL_ALLOCATION';
-    if (quantity === maxAffordableByExposure && quantity < rawQty && quantity < maxAffordableByAllocation) constrainedBy = 'MAX_TOTAL_EXPOSURE';
-    if (quantity === maxAffordableByCash && quantity < rawQty && quantity < maxAffordableByExposure && quantity < maxAffordableByAllocation) constrainedBy = 'AVAILABLE_CASH';
+    if (quantity < rawQty) {
+      if (maxAffordableByCash <= maxAffordableByAllocation && maxAffordableByCash <= maxAffordableByExposure) {
+        constrainedBy = 'AVAILABLE_CASH';
+      } else if (maxAffordableByExposure <= maxAffordableByAllocation) {
+        constrainedBy = 'MAX_TOTAL_EXPOSURE';
+      } else {
+        constrainedBy = 'MAX_CAPITAL_ALLOCATION';
+      }
+    }
 
     return {
       quantity,
@@ -222,7 +331,7 @@ export const RiskEngine = {
    * Policy: Determines whether general market operating hours (09:15-15:30) and weekend checks are bypassed.
    */
   shouldBypassMarketHours(settings = {}, marketState = null) {
-    return Boolean(settings?.bypassMarketHours || marketState?.bypassMarketHours);
+    return settings?.bypassMarketHours === true || marketState?.bypassMarketHours === true;
   },
 
   /**
@@ -231,11 +340,9 @@ export const RiskEngine = {
    * When bypassCutoff is true, cutoff is explicitly bypassed.
    */
   shouldBypassCutoff(settings = {}, marketState = null) {
-    return Boolean(
-      settings?.bypassCutoff ||
-      settings?.bypassMarketHours ||
-      marketState?.bypassMarketHours
-    );
+    return settings?.bypassCutoff === true ||
+      settings?.bypassMarketHours === true ||
+      marketState?.bypassMarketHours === true;
   },
 
   /**
@@ -246,25 +353,22 @@ export const RiskEngine = {
     const bypassHours = this.shouldBypassMarketHours(settings, marketState);
     const bypassCutoff = this.shouldBypassCutoff(settings, marketState);
 
-    const now = currentTime ? new Date(currentTime) : new Date();
-    const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
-    const ist = new Date(utc + (3600000 * 5.5));
-    const day = ist.getDay(); // 0 = Sun, 6 = Sat
-    const currentTimeNum = ist.getHours() * 100 + ist.getMinutes();
+    const ist = getIstParts(currentTime);
+    if (!ist) {
+      return { allowed: false, code: REJECTION_CODES.MARKET_CLOSED, reason: 'Unable to validate market time.' };
+    }
 
-    const [startH, startM] = (settings.tradingStartTime || '09:15').split(':').map(Number);
-    const [cutoffH, cutoffM] = (settings.intradayCutoffTime || '15:15').split(':').map(Number);
-    const startTimeNum = startH * 100 + startM;
-    const cutoffTimeNum = cutoffH * 100 + cutoffM;
-    const marketCloseTimeNum = 1530; // 15:30 IST regular close
+    const startMinutes = parseClockMinutes(settings.tradingStartTime, '09:15');
+    const cutoffMinutes = parseClockMinutes(settings.intradayCutoffTime, '15:15');
+    const marketCloseMinutes = 15 * 60 + 30;
 
     // 1. Weekend check
-    if (!bypassHours && (day === 0 || day === 6)) {
+    if (!bypassHours && (ist.day === 0 || ist.day === 6)) {
       return { allowed: false, code: REJECTION_CODES.MARKET_CLOSED, reason: 'Market is closed on weekends.' };
     }
 
     // 2. Pre-market start check
-    if (!bypassHours && currentTimeNum < startTimeNum) {
+    if (!bypassHours && ist.minutes < startMinutes) {
       return { 
         allowed: false, 
         code: REJECTION_CODES.TRADING_NOT_STARTED, 
@@ -273,7 +377,7 @@ export const RiskEngine = {
     }
 
     // 3. Regular market close check
-    if (!bypassHours && currentTimeNum >= marketCloseTimeNum) {
+    if (!bypassHours && ist.minutes >= marketCloseMinutes) {
       return { 
         allowed: false, 
         code: REJECTION_CODES.MARKET_CLOSED, 
@@ -282,7 +386,7 @@ export const RiskEngine = {
     }
 
     // 4. Intraday cutoff check (new entries blocked past 15:15 unless cutoff is bypassed)
-    if (!bypassCutoff && currentTimeNum >= cutoffTimeNum) {
+    if (!bypassCutoff && ist.minutes >= cutoffMinutes) {
       return { 
         allowed: false, 
         code: REJECTION_CODES.CUTOFF_TIME_REACHED, 
@@ -302,26 +406,51 @@ export const RiskEngine = {
       return false;
     }
 
-    const now = currentTime ? new Date(currentTime) : new Date();
-    const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
-    const ist = new Date(utc + (3600000 * 5.5));
-    const [cutoffH, cutoffM] = (settings?.intradayCutoffTime || '15:15').split(':').map(Number);
-    const currentNum = ist.getHours() * 100 + ist.getMinutes();
-    const cutoffNum = cutoffH * 100 + cutoffM;
-
-    return currentNum >= cutoffNum;
+    const ist = getIstParts(currentTime);
+    if (!ist) return true;
+    const cutoffMinutes = parseClockMinutes(settings?.intradayCutoffTime, '15:15');
+    return ist.minutes >= cutoffMinutes;
   },
 
   /**
    * Comprehensive Pre-Trade Validation Gate.
    * Checks all 12+ institutional risk rules before allowing order execution.
    */
-  validateTrade({ account, decision, stockInfo, marketState, customSettings, currentTime }) {
-    const settings = customSettings || this.loadSettings();
+  validateTrade({ account, decision, stockInfo, marketState, customSettings, currentTime } = {}) {
+    const settings = normalizeRiskSettings(customSettings || this.loadSettings());
 
-    // 1. Trade direction & decision validity
-    if (!decision || (decision.decision !== 'BUY' && decision.decision !== 'SHORT')) {
-      return { approved: false, code: 'NOT_ACTIONABLE', reason: 'Decision is WAIT or invalid' };
+    // 1. Trade direction & decision validity. Direction and action must agree;
+    // otherwise a malformed BUY could be executed as a short (or vice versa).
+    const expectedDirection = decision?.decision === 'BUY'
+      ? 'LONG'
+      : (decision?.decision === 'SHORT' ? 'SHORT' : null);
+    if (!decision || !expectedDirection || decision.direction !== expectedDirection) {
+      return { approved: false, code: 'NOT_ACTIONABLE', reason: 'Decision or trade direction is invalid.' };
+    }
+    if (!account || typeof account !== 'object') {
+      return { approved: false, code: REJECTION_CODES.INSUFFICIENT_CAPITAL, reason: 'Paper account state is unavailable.' };
+    }
+
+    const entry = asFiniteNumber(decision.entry);
+    const stopLoss = asFiniteNumber(decision.stopLoss);
+    const target1 = asFiniteNumber(decision.target1);
+    const confidence = asFiniteNumber(decision.confidence);
+    const cleanSym = normalizeSymbol(stockInfo?.sym || stockInfo?.symbol);
+
+    if (entry === null || entry <= 0 || !cleanSym) {
+      return { approved: false, code: 'NOT_ACTIONABLE', reason: 'Trade entry price or symbol is invalid.' };
+    }
+    if (stopLoss === null || stopLoss <= 0 ||
+        (expectedDirection === 'LONG' && stopLoss >= entry) ||
+        (expectedDirection === 'SHORT' && stopLoss <= entry)) {
+      return {
+        approved: false,
+        code: REJECTION_CODES.INVALID_STOP_LOSS,
+        reason: `${expectedDirection === 'LONG' ? 'Long' : 'Short'} Stop Loss must be a finite positive price strictly ${expectedDirection === 'LONG' ? 'below' : 'above'} Entry price.`,
+      };
+    }
+    if (confidence === null || confidence < 0 || confidence > 100) {
+      return { approved: false, code: REJECTION_CODES.LOW_CONFIDENCE, reason: 'AI confidence must be a finite percentage between 0 and 100.' };
     }
 
     // 2. Market State: Hours & Cutoff Time (IST: UTC + 5:30)
@@ -334,8 +463,15 @@ export const RiskEngine = {
       return { approved: false, code: timingCheck.code, reason: timingCheck.reason };
     }
 
-    // 3. Daily Loss Limit Check
-    if (account.dailyPnL <= -Math.abs(settings.maxDailyLoss)) {
+    const nowParts = getIstParts(currentTime);
+    const referenceTimestamp = nowParts?.timestamp ?? Date.now();
+
+    // 3. Daily Loss Limit Check. Include live losses so a losing open book cannot
+    // keep adding risk until those positions happen to close.
+    const realizedDaily = asFiniteNumber(account.dailyPnL) ?? 0;
+    const unrealizedDaily = asFiniteNumber(account.unrealizedPnL) ?? 0;
+    const netDailyPnL = realizedDaily + unrealizedDaily;
+    if (netDailyPnL < 0 && netDailyPnL <= -settings.maxDailyLoss) {
       return { 
         approved: false, 
         code: REJECTION_CODES.DAILY_LOSS_LIMIT, 
@@ -344,8 +480,11 @@ export const RiskEngine = {
     }
 
     // 4. Maximum Simultaneous Positions & Duplicate Symbol Check
-    const activeList = account.activePositions || (account.activePosition ? [account.activePosition] : []);
-    const maxPositions = settings.maxSimultaneousPositions ?? 4;
+    const activeList = (Array.isArray(account.activePositions)
+      ? account.activePositions
+      : (account.activePosition ? [account.activePosition] : []))
+      .filter(position => position && position.status !== 'POSITION_CLOSED');
+    const maxPositions = settings.maxSimultaneousPositions;
     if (activeList.length >= maxPositions) {
       return { 
         approved: false, 
@@ -353,8 +492,7 @@ export const RiskEngine = {
         reason: `Max simultaneous positions (${maxPositions}) already active.` 
       };
     }
-    const cleanSym = (stockInfo?.sym || '').toUpperCase().replace('.NS', '');
-    if (activeList.some(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanSym)) {
+    if (activeList.some(p => normalizeSymbol(p.symbol) === cleanSym)) {
       return {
         approved: false,
         code: REJECTION_CODES.MAX_POSITIONS_REACHED,
@@ -362,9 +500,14 @@ export const RiskEngine = {
       };
     }
 
-    // 5. Maximum Daily Trades
-    const todayClosedCount = (account.closedPositions || []).length;
-    if (todayClosedCount >= settings.maxTradesPerDay) {
+    const closed = Array.isArray(account.closedPositions) ? account.closedPositions : [];
+    const dateKey = nowParts?.dateKey;
+    const todayClosed = dateKey ? closed.filter(trade => isTradeFromDate(trade, dateKey)) : closed;
+    const todayActive = dateKey ? activeList.filter(trade => isTradeFromDate(trade, dateKey)) : activeList;
+
+    // 5. Maximum Daily Trades. Count filled open entries as trades too; counting
+    // only closed positions allowed maxTradesPerDay + maxPositions entries.
+    if (todayClosed.length + todayActive.length >= settings.maxTradesPerDay) {
       return { 
         approved: false, 
         code: REJECTION_CODES.MAX_DAILY_TRADES, 
@@ -373,8 +516,9 @@ export const RiskEngine = {
     }
 
     // 6. Maximum Trades per Stock (Symbol Specific)
-    const symbolTrades = (account.closedPositions || []).filter(p => p.symbol === cleanSym);
-    if (symbolTrades.length >= settings.maxTradesPerStock) {
+    const symbolTrades = todayClosed.filter(p => normalizeSymbol(p.symbol) === cleanSym);
+    const activeSymbolTrades = todayActive.filter(p => normalizeSymbol(p.symbol) === cleanSym);
+    if (symbolTrades.length + activeSymbolTrades.length >= settings.maxTradesPerStock) {
       return { 
         approved: false, 
         code: REJECTION_CODES.MAX_TRADES_PER_STOCK, 
@@ -383,10 +527,9 @@ export const RiskEngine = {
     }
 
     // 7. Maximum Consecutive Losses Protection
-    const closed = account.closedPositions || [];
-    if (closed.length >= settings.maxConsecutiveLosses) {
-      const recentTrades = closed.slice(-settings.maxConsecutiveLosses);
-      const allLosses = recentTrades.every(t => (t.realizedPnL || 0) < 0);
+    if (settings.maxConsecutiveLosses > 0 && todayClosed.length >= settings.maxConsecutiveLosses) {
+      const recentTrades = todayClosed.slice(-settings.maxConsecutiveLosses);
+      const allLosses = recentTrades.every(t => (asFiniteNumber(t.realizedPnL) ?? 0) < 0);
       if (allLosses) {
         return { 
           approved: false, 
@@ -401,7 +544,9 @@ export const RiskEngine = {
       const lastTrade = symbolTrades[symbolTrades.length - 1];
       if (lastTrade.exitTime) {
         const exitTimeMs = new Date(lastTrade.exitTime).getTime();
-        const diffMinutes = (Date.now() - exitTimeMs) / 60000;
+        const diffMinutes = Number.isFinite(exitTimeMs)
+          ? Math.max(0, (referenceTimestamp - exitTimeMs) / 60000)
+          : Number.POSITIVE_INFINITY;
 
         if (diffMinutes < settings.cooldownMinutes) {
           const remainingSec = Math.ceil((settings.cooldownMinutes - diffMinutes) * 60);
@@ -414,17 +559,18 @@ export const RiskEngine = {
 
         // Revenge trading guard: stopped out on same setup
         if (lastTrade.exitReason === 'Stop Loss Hit' && lastTrade.setup === decision.setup && diffMinutes < 15) {
+          const setupLabel = typeof decision.setup === 'string' ? decision.setup.replace(/_/g, ' ') : 'the same setup';
           return {
             approved: false,
             code: REJECTION_CODES.REVENGE_TRADING_BLOCKED,
-            reason: `Recent stop-out on ${decision.setup.replace(/_/g, ' ')}. Requires higher timeframe confirmation.`
+            reason: `Recent stop-out on ${setupLabel}. Requires higher timeframe confirmation.`
           };
         }
       }
     }
 
     // 9. AI Quality & Confidence Gate
-    if (decision.confidence < settings.minAiConfidence) {
+    if (confidence < settings.minAiConfidence) {
       return { 
         approved: false, 
         code: REJECTION_CODES.LOW_CONFIDENCE, 
@@ -433,10 +579,16 @@ export const RiskEngine = {
     }
 
     // 10. Risk/Reward Ratio Gate
-    const targetDistance = Math.abs((decision.target1 || 0) - decision.entry);
-    const stopDistance = Math.abs(decision.entry - (decision.stopLoss || 0));
+    const targetIsValid = target1 !== null && target1 > 0 &&
+      (expectedDirection === 'LONG' ? target1 > entry : target1 < entry);
+    const targetDistance = targetIsValid ? Math.abs(target1 - entry) : 0;
+    const stopDistance = Math.abs(entry - stopLoss);
     const calculatedRR = stopDistance > 0 ? parseFloat((targetDistance / stopDistance).toFixed(2)) : 0;
-    const tradeRR = decision.riskReward || calculatedRR;
+    const reportedRR = asFiniteNumber(decision.riskReward);
+    // Never trust an AI-reported ratio that is more optimistic than its actual levels.
+    const tradeRR = reportedRR !== null && reportedRR >= 0
+      ? Math.min(reportedRR, calculatedRR)
+      : calculatedRR;
 
     if (tradeRR < settings.minRiskReward) {
       return { 
@@ -446,26 +598,22 @@ export const RiskEngine = {
       };
     }
 
-    // 11. Stop-Loss Structural Sanity
-    if (!decision.stopLoss || decision.stopLoss <= 0) {
-      return { approved: false, code: REJECTION_CODES.INVALID_STOP_LOSS, reason: 'Stop loss is missing or zero.' };
-    }
-    if (decision.direction === 'LONG' && decision.stopLoss >= decision.entry) {
-      return { approved: false, code: REJECTION_CODES.INVALID_STOP_LOSS, reason: 'Long Stop Loss must be strictly below Entry price.' };
-    }
-    if (decision.direction === 'SHORT' && decision.stopLoss <= decision.entry) {
-      return { approved: false, code: REJECTION_CODES.INVALID_STOP_LOSS, reason: 'Short Stop Loss must be strictly above Entry price.' };
-    }
-
-    // 12. Position Sizing & Capital Feasibility
-    const currentExposure = account.usedCapital !== undefined
-      ? account.usedCapital
-      : (account.activePositions || []).reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
+    // 11. Position Sizing & Capital Feasibility. Recompute exposure from positions
+    // and take the larger stored value so stale bookkeeping cannot loosen the cap.
+    const positionsExposure = activeList.reduce((sum, position) => {
+      const positionEntry = asFiniteNumber(position.entryPrice);
+      const positionQuantity = asFiniteNumber(position.quantity);
+      return positionEntry !== null && positionEntry > 0 && positionQuantity !== null && positionQuantity > 0
+        ? sum + positionEntry * positionQuantity
+        : sum;
+    }, 0);
+    const storedExposure = asFiniteNumber(account.usedCapital);
+    const currentExposure = Math.max(positionsExposure, storedExposure !== null ? Math.max(0, storedExposure) : 0);
     const sizeResult = this.calculatePositionSize({
       accountValue: account.accountValue,
       availableCash: account.availableCash,
-      entryPrice: decision.entry,
-      stopLoss: decision.stopLoss,
+      entryPrice: entry,
+      stopLoss,
       settings,
       currentExposure,
     });

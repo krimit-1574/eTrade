@@ -6,16 +6,19 @@ import { api } from '../api';
 export default function SettingsPage({ user, onLogout }) {
   const [avKey, setAvKey] = useState('');
   const [geminiKey, setGeminiKey] = useState('');
+  const [keyStatus, setKeyStatus] = useState({ av: '', gemini: '' });
   const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     if (user.user_id === 'guest') return;
     api.getSettings(user.user_id).then((s) => {
-      setAvKey(s.av_key || '');
-      setGeminiKey(s.gemini_key || '');
+      setKeyStatus({
+        av: s.has_av_key ? s.av_key_hint || 'saved' : '',
+        gemini: s.has_gemini_key ? s.gemini_key_hint || 'saved' : '',
+      });
     }).catch(() => {});
-  }, []);
+  }, [user.user_id]);
 
   const handleSave = async () => {
     if (user.user_id === 'guest') {
@@ -25,6 +28,12 @@ export default function SettingsPage({ user, onLogout }) {
     setSaved(false);
     try {
       await api.updateSettings(user.user_id, avKey, geminiKey);
+      setKeyStatus((current) => ({
+        av: avKey ? `...${avKey.slice(-4)}` : current.av,
+        gemini: geminiKey ? `...${geminiKey.slice(-4)}` : current.gemini,
+      }));
+      setAvKey('');
+      setGeminiKey('');
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
     } catch { /* ignore */ }
@@ -51,7 +60,9 @@ export default function SettingsPage({ user, onLogout }) {
             </p>
             <input
               className="input"
-              placeholder="Enter your Alpha Vantage API key..."
+              type="password"
+              autoComplete="off"
+              placeholder={keyStatus.av ? `Saved (${keyStatus.av}); enter a new key to replace` : 'Enter your Alpha Vantage API key...'}
               value={avKey}
               onChange={(e) => setAvKey(e.target.value)}
               id="settings-av-key"
@@ -65,7 +76,8 @@ export default function SettingsPage({ user, onLogout }) {
             <input
               className="input"
               type="password"
-              placeholder="Enter your Gemini API key..."
+              autoComplete="off"
+              placeholder={keyStatus.gemini ? `Saved (${keyStatus.gemini}); enter a new key to replace` : 'Enter your Gemini API key...'}
               value={geminiKey}
               onChange={(e) => setGeminiKey(e.target.value)}
               id="settings-gemini-key"
@@ -76,7 +88,7 @@ export default function SettingsPage({ user, onLogout }) {
         <div style={{ marginTop: '24px' }}>
           {user.user_id === 'guest' ? (
             <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-              Sign in with an account to save API keys. Guest mode uses server environment keys only.
+              Sign in with an account to save API keys and use AI-backed features.
             </p>
           ) : (
             <button className="btn btn-primary" onClick={handleSave} disabled={loading} id="settings-save-btn">

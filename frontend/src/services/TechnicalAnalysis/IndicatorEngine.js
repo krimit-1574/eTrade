@@ -61,7 +61,7 @@ export const IndicatorEngine = {
       avgLoss = ((avgLoss * (period - 1)) + loss) / period;
     }
 
-    if (avgLoss === 0) return 100;
+    if (avgLoss === 0) return avgGain === 0 ? 50 : 100;
     const rs = avgGain / avgLoss;
     return 100 - (100 / (1 + rs));
   },
@@ -179,22 +179,33 @@ export const IndicatorEngine = {
     const lastCandleTs = typeof data[data.length - 1].time === 'number' 
       ? data[data.length - 1].time * 1000 
       : new Date(data[data.length - 1].time).getTime();
-    const currentDay = new Date(lastCandleTs).toDateString();
+    if (!Number.isFinite(lastCandleTs)) return null;
+    const currentDay = new Date(lastCandleTs).toISOString().slice(0, 10);
 
     for (let i = 0; i < data.length; i++) {
       const candle = data[i];
       const ts = typeof candle.time === 'number' ? candle.time * 1000 : new Date(candle.time).getTime();
       
-      if (new Date(ts).toDateString() === currentDay) {
-        const typicalPrice = (candle.high + candle.low + candle.close) / 3;
-        const vol = candle.volume || 1;
+      if (Number.isFinite(ts) && new Date(ts).toISOString().slice(0, 10) === currentDay) {
+        const high = Number(candle.high);
+        const low = Number(candle.low);
+        const close = Number(candle.close);
+        const parsedVolume = Number(candle.volume);
+        if (![high, low, close].every(Number.isFinite)) continue;
+        const vol = Number.isFinite(parsedVolume) && parsedVolume > 0 ? parsedVolume : 0;
+        const typicalPrice = (high + low + close) / 3;
         
-        cumTypicalVolume += typicalPrice * vol;
-        cumVolume += vol;
+        if (vol > 0) {
+          cumTypicalVolume += typicalPrice * vol;
+          cumVolume += vol;
+        }
       }
     }
 
-    if (cumVolume === 0) return data[data.length - 1].close;
+    if (cumVolume === 0) {
+      const lastClose = Number(data[data.length - 1].close);
+      return Number.isFinite(lastClose) ? lastClose : null;
+    }
     return cumTypicalVolume / cumVolume;
   },
 
@@ -212,10 +223,12 @@ export const IndicatorEngine = {
    * Calculates Relative Volume (RVOL).
    */
   RelativeVolume(data, period = 20) {
-    if (!data || data.length < period) return null;
-    const currentVol = data[data.length - 1].volume || 0;
-    const avgVol = this.VolumeAverage(data, period);
-    if (!avgVol || avgVol === 0) return 1;
+    if (!data || data.length <= period) return null;
+    const currentVol = Number(data[data.length - 1].volume);
+    if (!Number.isFinite(currentVol) || currentVol < 0) return null;
+    const previousCandles = data.slice(-(period + 1), -1);
+    const avgVol = this.VolumeAverage(previousCandles, period);
+    if (!Number.isFinite(avgVol) || avgVol <= 0) return null;
     return currentVol / avgVol;
   }
 };

@@ -6,19 +6,49 @@
 
 import { BIAS_TYPES } from './MarketDataTypes';
 
+function finiteNumber(value, fallback = null) {
+  if (value === null || value === undefined || value === '') return fallback;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
 export const IntradayScoreEngine = {
   /**
    * Calculates modular sub-scores, total AI score, bias, and confidence for a stock item.
    */
   scoreStock(stock) {
-    const price = stock.price || stock.currentPrice || 0;
-    const vwap = stock.vwap || price;
-    const rsi = stock.rsi || 50;
-    const rvol = stock.rvol || stock.volumeRatio || 1.0;
-    const changePct = stock.changePct || 0;
-    const high = stock.high || price;
-    const low = stock.low || price;
-    const open = stock.open || price;
+    const source = stock && typeof stock === 'object' ? stock : {};
+    const price = finiteNumber(source.price, finiteNumber(source.currentPrice, 0));
+    const high = finiteNumber(source.high, price);
+    const low = finiteNumber(source.low, price);
+    const open = finiteNumber(source.open, price);
+    const vwap = finiteNumber(source.vwap, price);
+    const rsi = finiteNumber(source.rsi, 50);
+    // Missing/zero volume is not evidence of average participation.
+    const rvol = finiteNumber(source.rvol, finiteNumber(source.volumeRatio, 0));
+    const changePct = finiteNumber(source.changePct, 0);
+
+    const validMarketData = price > 0 && high > 0 && low > 0 && open > 0 &&
+      high >= low && high >= Math.max(open, price) && low <= Math.min(open, price) &&
+      vwap > 0 && rsi >= 0 && rsi <= 100 && rvol >= 0;
+
+    if (!validMarketData) {
+      return {
+        ...source,
+        aiScore: 0,
+        aiConfidence: 0,
+        bias: BIAS_TYPES.WAIT,
+        dataQuality: 'INVALID',
+        scoreBreakdown: {
+          trend: 0,
+          momentum: 0,
+          volume: 0,
+          volatility: 0,
+          liquidity: 0,
+          breakout: 0,
+        },
+      };
+    }
 
     const dayRangePct = low > 0 ? ((high - low) / low) * 100 : 0;
     const distFromHighPct = high > 0 ? ((high - price) / high) * 100 : 0;
@@ -98,10 +128,11 @@ export const IntradayScoreEngine = {
     const confidencePct = Math.max(45, Math.min(96, Math.round((agreeingSignals / totalSignals) * 100)));
 
     return {
-      ...stock,
+      ...source,
       aiScore,
       aiConfidence: confidencePct,
       bias,
+      dataQuality: 'VALID',
       scoreBreakdown: {
         trend: trendScore,
         momentum: momentumScore,

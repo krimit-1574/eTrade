@@ -5,6 +5,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 
 def calculate_technical_indicators(df):
+    df = df.copy()
     # RSI (Relative Strength Index)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
@@ -30,6 +31,7 @@ def calculate_technical_indicators(df):
     # Target: 1 if close price 5 days from now is higher than today, else 0
     df['Target'] = (df['Close'].shift(-5) > df['Close']).astype(int)
 
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
     return df
 
@@ -39,11 +41,15 @@ def fetch_and_prepare_data(symbol, period="2y"):
         sym_list.extend([f"{symbol}.NS", f"{symbol}.BO"])
 
     for s in sym_list:
-        ticker = yf.Ticker(s)
-        df = ticker.history(period=period)
-        if not df.empty and len(df) >= 100:
-            df = calculate_technical_indicators(df)
-            return df
+        try:
+            ticker = yf.Ticker(s)
+            df = ticker.history(period=period)
+            if not df.empty and len(df) >= 100:
+                df = calculate_technical_indicators(df)
+                if len(df) >= 55:
+                    return df
+        except Exception:
+            continue
     return None
 
 def train_and_predict(df):
@@ -64,7 +70,11 @@ def train_and_predict(df):
 
     # Predict probability for the most recent day
     latest_features = X.iloc[[-1]]
-    prob_up = model.predict_proba(latest_features)[0][1] # Probability of class 1 (price going up)
+    probabilities = model.predict_proba(latest_features)[0]
+    classes = list(model.classes_)
+    # A strongly one-directional history can contain only one target class.
+    # sklearn then returns a single probability column rather than class 0/1.
+    prob_up = float(probabilities[classes.index(1)]) if 1 in classes else 0.0
     
     # Technical Indicator Scoring for Bullish vs Bearish Run Scale
     latest = df.iloc[-1]

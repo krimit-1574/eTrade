@@ -1,13 +1,37 @@
-import { useState, useEffect } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { motion as Motion, AnimatePresence } from 'framer-motion';
 import { DollarSign, TrendingUp, TrendingDown, RefreshCw, ShoppingCart, ArrowUpRight, ArrowDownRight, Activity, Plus, Search, Eye, CheckCircle, AlertCircle } from 'lucide-react';
 import { api } from '../api';
+
+async function loadLivePrices(portfolioItems) {
+  const results = await Promise.allSettled(
+    portfolioItems.map(async (position) => {
+      const response = await api.getPrice(position.symbol);
+      const price = Number(response?.price);
+      if (!Number.isFinite(price) || price <= 0) return null;
+
+      const change = Number(response?.change);
+      const pct = Number(response?.pct);
+      return [position.symbol, {
+        price,
+        change: Number.isFinite(change) ? change : 0,
+        pct: Number.isFinite(pct) ? pct : 0,
+      }];
+    }),
+  );
+
+  return Object.fromEntries(
+    results
+      .filter((result) => result.status === 'fulfilled' && result.value)
+      .map((result) => result.value),
+  );
+}
 
 export default function TradingPage({ user, onAnalyze, initialSymbol = '' }) {
   const [summary, setSummary] = useState({ virtual_cash: 1000000.0, portfolio: [], transactions: [] });
   const [livePrices, setLivePrices] = useState({});
   const [refreshing, setRefreshing] = useState(false);
-  const [showOrderModal, setShowOrderModal] = useState(false);
+  const [showOrderModal, setShowOrderModal] = useState(Boolean(initialSymbol));
   
   // Order Form State
   const [orderType, setOrderType] = useState('BUY'); // BUY or SELL
@@ -23,90 +47,85 @@ export default function TradingPage({ user, onAnalyze, initialSymbol = '' }) {
   // Search suggestions inside order modal
   const [searchResults, setSearchResults] = useState([]);
   const [showSearchDropdown, setShowSearchDropdown] = useState(false);
+  const quoteRequestRef = useRef(0);
 
   const isGuest = user?.user_id === 'guest';
 
-  const fetchSummary = async () => {
+  const fetchSummary = useCallback(async () => {
     if (!user || user.user_id === 'guest') return;
     try {
       const res = await api.getTradingSummary(user.user_id);
       setSummary(res);
-      refreshLivePrices(res.portfolio);
+      const prices = await loadLivePrices(Array.isArray(res.portfolio) ? res.portfolio : []);
+      setLivePrices(prices);
     } catch { /* ignore */ }
-  };
+  }, [user]);
 
-  const handleFetchLiveQuote = async (sym) => {
-    if (!sym) return;
+  const handleFetchLiveQuote = useCallback(async (sym) => {
+    const normalizedSymbol = sym?.trim();
+    if (!normalizedSymbol) return;
+    const requestId = ++quoteRequestRef.current;
     setFetchingPrice(true);
     try {
-      const data = await api.getPrice(sym);
-      if (data && data.price !== 'N/A') {
-        setPriceInput(data.price);
+      const data = await api.getPrice(normalizedSymbol);
+      const price = Number(data?.price);
+      if (requestId === quoteRequestRef.current && Number.isFinite(price) && price > 0) {
+        setPriceInput(String(price));
         if (data.symbol) setSymbolInput(data.symbol);
       }
     } catch { /* ignore */ }
     finally {
-      setFetchingPrice(false);
+      if (requestId === quoteRequestRef.current) setFetchingPrice(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    fetchSummary();
-  }, [user]);
+    void fetchSummary();
+  }, [fetchSummary]);
 
   // Open modal if initialSymbol provided
   useEffect(() => {
     if (initialSymbol) {
-      setSymbolInput(initialSymbol);
-      handleFetchLiveQuote(initialSymbol);
-      setShowOrderModal(true);
+      void handleFetchLiveQuote(initialSymbol);
     }
-  }, [initialSymbol]);
+  }, [initialSymbol, handleFetchLiveQuote]);
 
   // Live Price refresh for active portfolio positions
   const refreshLivePrices = async (portfolioItems = summary.portfolio) => {
-    if (!portfolioItems || portfolioItems.length === 0) return;
+    if (!Array.isArray(portfolioItems) || portfolioItems.length === 0) {
+      setLivePrices({});
+      return;
+    }
     setRefreshing(true);
-    const updatedPrices = { ...livePrices };
-
-    await Promise.allSettled(
-      portfolioItems.map(async (pos) => {
-        try {
-          const res = await api.getPrice(pos.symbol);
-          if (res && res.price !== 'N/A') {
-            updatedPrices[pos.symbol] = {
-              price: parseFloat(res.price),
-              change: parseFloat(res.change || 0),
-              pct: parseFloat(res.pct || 0),
-            };
-          }
-        } catch { /* ignore */ }
-      })
-    );
-
-    setLivePrices(updatedPrices);
-    setRefreshing(false);
+    try {
+      const updatedPrices = await loadLivePrices(portfolioItems);
+      setLivePrices((previous) => ({ ...previous, ...updatedPrices }));
+    } finally {
+      setRefreshing(false);
+    }
   };
 
   // Live search inside order modal
   useEffect(() => {
-    if (!symbolInput.trim() || symbolInput.length < 2) {
-      setSearchResults([]);
-      setShowSearchDropdown(false);
-      return;
-    }
+    if (symbolInput.trim().length < 2) return undefined;
 
+    let cancelled = false;
     const timer = setTimeout(async () => {
       try {
         const res = await api.searchSymbols(symbolInput);
-        setSearchResults(res.results || []);
-        setShowSearchDropdown(true);
+        if (!cancelled) {
+          setSearchResults(res.results || []);
+          setShowSearchDropdown(true);
+        }
       } catch {
-        setSearchResults([]);
+        if (!cancelled) setSearchResults([]);
       }
     }, 300);
 
-    return () => clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [symbolInput]);
 
   const handleOpenOrder = (sym = '', name = '', type = 'BUY', defaultPrice = '') => {
@@ -167,21 +186,24 @@ export default function TradingPage({ user, onAnalyze, initialSymbol = '' }) {
   };
 
   // Calculation of Portfolio Performance
-  const activePortfolio = summary.portfolio || [];
+  const activePortfolio = Array.isArray(summary.portfolio) ? summary.portfolio : [];
   let totalInvested = 0;
   let totalCurrentValue = 0;
 
   activePortfolio.forEach((pos) => {
-    const live = livePrices[pos.symbol]?.price || pos.buy_price;
-    const inv = pos.quantity * pos.buy_price;
-    const curVal = pos.quantity * live;
+    const positionQuantity = Number(pos.quantity) || 0;
+    const buyPrice = Number(pos.buy_price) || 0;
+    const live = livePrices[pos.symbol]?.price ?? buyPrice;
+    const inv = positionQuantity * buyPrice;
+    const curVal = positionQuantity * live;
     totalInvested += inv;
     totalCurrentValue += curVal;
   });
 
   const totalPnL = totalCurrentValue - totalInvested;
   const totalPnLPct = totalInvested > 0 ? (totalPnL / totalInvested) * 100 : 0;
-  const virtualCash = summary.virtual_cash || 1000000.0;
+  const parsedVirtualCash = Number(summary.virtual_cash ?? 1000000.0);
+  const virtualCash = Number.isFinite(parsedVirtualCash) ? parsedVirtualCash : 0;
   const netWorth = virtualCash + totalCurrentValue;
 
   return (
@@ -282,9 +304,11 @@ export default function TradingPage({ user, onAnalyze, initialSymbol = '' }) {
               </thead>
               <tbody>
                 {activePortfolio.map((pos) => {
-                  const live = livePrices[pos.symbol]?.price || pos.buy_price;
-                  const invVal = pos.quantity * pos.buy_price;
-                  const curVal = pos.quantity * live;
+                  const positionQuantity = Number(pos.quantity) || 0;
+                  const buyPrice = Number(pos.buy_price) || 0;
+                  const live = livePrices[pos.symbol]?.price ?? buyPrice;
+                  const invVal = positionQuantity * buyPrice;
+                  const curVal = positionQuantity * live;
                   const posPnL = curVal - invVal;
                   const posPnLPct = invVal > 0 ? (posPnL / invVal) * 100 : 0;
                   const isProfit = posPnL >= 0;
@@ -295,8 +319,8 @@ export default function TradingPage({ user, onAnalyze, initialSymbol = '' }) {
                         <div style={{ fontWeight: 700, color: 'var(--text-primary)' }}>{pos.symbol}</div>
                         <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{pos.name}</div>
                       </td>
-                      <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600 }}>{pos.quantity}</td>
-                      <td style={{ padding: '8px', textAlign: 'right' }}>₹{pos.buy_price.toFixed(2)}</td>
+                      <td style={{ padding: '8px', textAlign: 'right', fontWeight: 600 }}>{positionQuantity}</td>
+                      <td style={{ padding: '8px', textAlign: 'right' }}>₹{buyPrice.toFixed(2)}</td>
                       <td style={{ padding: '8px', textAlign: 'right', fontWeight: 700, color: 'var(--neon-cyan)' }}>
                         ₹{live.toFixed(2)}
                       </td>
@@ -350,7 +374,7 @@ export default function TradingPage({ user, onAnalyze, initialSymbol = '' }) {
       {/* Transaction History Ledger */}
       <div className="card" style={{ padding: '20px' }}>
         <h3 style={{ fontSize: '1.1rem', fontWeight: 700, marginBottom: '16px' }}>📜 Recent Order Execution History</h3>
-        {summary.transactions?.length === 0 ? (
+        {(summary.transactions?.length ?? 0) === 0 ? (
           <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>No past order transactions found.</p>
         ) : (
           <div style={{ overflowX: 'auto' }}>
@@ -376,9 +400,9 @@ export default function TradingPage({ user, onAnalyze, initialSymbol = '' }) {
                     </td>
                     <td style={{ padding: '8px', fontWeight: 700 }}>{tx.symbol}</td>
                     <td style={{ padding: '8px', textAlign: 'right' }}>{tx.quantity}</td>
-                    <td style={{ padding: '8px', textAlign: 'right' }}>₹{tx.price.toFixed(2)}</td>
+                    <td style={{ padding: '8px', textAlign: 'right' }}>₹{(Number(tx.price) || 0).toFixed(2)}</td>
                     <td style={{ padding: '8px', textAlign: 'right', fontWeight: 700 }}>
-                      ₹{tx.total_amount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                      ₹{(Number(tx.total_amount) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
                     </td>
                   </tr>
                 ))}
@@ -392,7 +416,7 @@ export default function TradingPage({ user, onAnalyze, initialSymbol = '' }) {
       <AnimatePresence>
         {showOrderModal && (
           <div className="spinner-overlay" style={{ background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(8px)', zIndex: 100 }}>
-            <motion.div 
+            <Motion.div 
               className="card" 
               initial={{ scale: 0.9, opacity: 0 }} 
               animate={{ scale: 1, opacity: 1 }} 
@@ -435,8 +459,13 @@ export default function TradingPage({ user, onAnalyze, initialSymbol = '' }) {
                       placeholder="e.g. RELIANCE.NS, ZOMATO, AAPL..."
                       value={symbolInput}
                       onChange={(e) => {
-                        setSymbolInput(e.target.value);
-                        setNameInput(e.target.value);
+                        const value = e.target.value;
+                        setSymbolInput(value);
+                        setNameInput(value);
+                        if (value.trim().length < 2) {
+                          setSearchResults([]);
+                          setShowSearchDropdown(false);
+                        }
                       }}
                     />
                     <button 
@@ -525,7 +554,7 @@ export default function TradingPage({ user, onAnalyze, initialSymbol = '' }) {
                   </button>
                 </div>
               </form>
-            </motion.div>
+            </Motion.div>
           </div>
         )}
       </AnimatePresence>

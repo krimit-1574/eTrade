@@ -15,7 +15,23 @@ export const AITradingDecisionEngine = {
    * @returns {Object} - Trade Decision Object
    */
   evaluate(analysis, currentPrice, marketContext = null) {
-    if (!analysis || !currentPrice) return this._createWaitDecision("Insufficient data for analysis.");
+    const price = Number(currentPrice);
+    if (!analysis || typeof analysis !== 'object' || !Number.isFinite(price) || price <= 0) {
+      return this._createWaitDecision('Insufficient or invalid data for analysis.');
+    }
+
+    if (
+      (analysis.setup === 'potential_long_breakout' || analysis.setup === 'potential_short_breakdown') &&
+      (!Number.isFinite(Number(analysis.atr)) || Number(analysis.atr) <= 0 ||
+        !Number.isFinite(Number(analysis.relativeVolume)) || Number(analysis.relativeVolume) < 0 ||
+        !Number.isFinite(Number(analysis.setupStrength)))
+    ) {
+      return this._createWaitDecision(
+        'Required ATR, volume, or setup-strength data is unavailable.',
+        analysis.setup,
+        Number.isFinite(Number(analysis.setupStrength)) ? Number(analysis.setupStrength) : 0
+      );
+    }
 
     // Market Context Invalidation Check (Part 10)
     // If the broad market is in severe breakdown and we're looking at a long setup, warn
@@ -24,7 +40,7 @@ export const AITradingDecisionEngine = {
       if (regime.bias === 'WAIT' && regime.regime === 'HIGH_VOLATILITY') {
         // Don't outright block, but add invalidation note for high-volatility divergence
         if (analysis.setup === 'potential_long_breakout' || analysis.setup === 'potential_short_breakdown') {
-          const decision = this._evaluateStrategy(analysis, currentPrice);
+          const decision = this._validateDecision(this._evaluateStrategy(analysis, price), price);
           if (decision.decision !== 'WAIT') {
             decision.invalidation = (decision.invalidation || '') +
               ` ⚠ Market Context: ${regime.label} — elevated sectoral divergence detected. Proceed with caution.`;
@@ -34,7 +50,7 @@ export const AITradingDecisionEngine = {
       }
     }
 
-    return this._evaluateStrategy(analysis, currentPrice);
+    return this._validateDecision(this._evaluateStrategy(analysis, price), price);
   },
 
   /**
@@ -78,6 +94,32 @@ export const AITradingDecisionEngine = {
       target2: null,
       riskReward: null
     };
+  },
+
+  _validateDecision(decision, currentPrice) {
+    if (!decision || (decision.decision !== 'BUY' && decision.decision !== 'SHORT')) {
+      return decision || this._createWaitDecision('Strategy did not return a valid decision.');
+    }
+
+    const entry = Number(decision.entry);
+    const stopLoss = Number(decision.stopLoss);
+    const target1 = Number(decision.target1);
+    const target2 = Number(decision.target2);
+    const isFinitePlan = [entry, stopLoss, target1, target2].every(
+      value => Number.isFinite(value) && value > 0
+    );
+    const isDirectionallyValid = decision.decision === 'BUY'
+      ? stopLoss < entry && target1 > entry && target2 >= target1
+      : stopLoss > entry && target1 < entry && target2 <= target1;
+
+    if (!isFinitePlan || !isDirectionallyValid || Math.abs(entry - currentPrice) / currentPrice > 0.1) {
+      return this._createWaitDecision(
+        'Strategy produced invalid or stale entry, stop, or target levels.',
+        decision.setup,
+        decision.confidence
+      );
+    }
+
+    return decision;
   }
 };
-

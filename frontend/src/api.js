@@ -1,119 +1,196 @@
 const API = typeof window !== 'undefined' && window.location?.origin ? '' : 'http://localhost:8000';
+const TOKEN_STORAGE_KEY = 'eTA_auth_token';
+
+function readStoredToken() {
+  try {
+    return typeof localStorage !== 'undefined' ? localStorage.getItem(TOKEN_STORAGE_KEY) || '' : '';
+  } catch {
+    return '';
+  }
+}
+
+let authToken = readStoredToken();
+
+function setAuthToken(token) {
+  authToken = typeof token === 'string' ? token : '';
+  try {
+    if (typeof localStorage !== 'undefined') {
+      if (authToken) localStorage.setItem(TOKEN_STORAGE_KEY, authToken);
+      else localStorage.removeItem(TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    // In-memory auth still works when browser storage is unavailable.
+  }
+}
+
+function clearAuthToken() {
+  setAuthToken('');
+}
 
 function formatError(detail) {
   if (!detail) return 'Request failed';
   if (typeof detail === 'string') return detail;
   if (Array.isArray(detail)) {
-    return detail.map((d) => d.msg || JSON.stringify(d)).join('; ');
+    return detail.map((item) => item.msg || JSON.stringify(item)).join('; ');
   }
   return String(detail);
 }
 
+function notifyUnauthorized() {
+  clearAuthToken();
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+    window.dispatchEvent(new CustomEvent('eta:unauthorized'));
+  }
+}
+
 async function request(url, options = {}) {
-  const res = await fetch(`${API}${url}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
-    ...options,
-  });
+  const { auth = true, headers: optionHeaders = {}, ...fetchOptions } = options;
+  const headers = { 'Content-Type': 'application/json', ...optionHeaders };
+  if (auth && authToken) headers.Authorization = `Bearer ${authToken}`;
+
+  const res = await fetch(`${API}${url}`, { ...fetchOptions, headers });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Request failed' }));
-    throw new Error(formatError(err.detail));
+    if (auth && res.status === 401) notifyUnauthorized();
+    const error = new Error(formatError(err.detail));
+    error.status = res.status;
+    throw error;
   }
+  if (res.status === 204) return null;
   return res.json();
 }
 
+async function requestBlob(url, options = {}) {
+  const { headers: optionHeaders = {}, ...fetchOptions } = options;
+  const headers = { ...optionHeaders };
+  if (authToken) headers.Authorization = `Bearer ${authToken}`;
+  const res = await fetch(`${API}${url}`, { ...fetchOptions, headers });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Request failed' }));
+    if (res.status === 401) notifyUnauthorized();
+    const error = new Error(formatError(err.detail));
+    error.status = res.status;
+    throw error;
+  }
+  return res.blob();
+}
+
 export const api = {
+  setAuthToken,
+  clearAuthToken,
+
   // Auth
   login: (username, password) =>
-    request('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
+    request('/api/auth/login', {
+      method: 'POST',
+      auth: false,
+      body: JSON.stringify({ username, password }),
+    }),
   register: (username, password, email, dob) =>
-    request('/api/auth/register', { method: 'POST', body: JSON.stringify({ username, password, email, dob }) }),
-  guestLogin: () =>
-    request('/api/auth/guest', { method: 'POST' }),
+    request('/api/auth/register', {
+      method: 'POST',
+      auth: false,
+      body: JSON.stringify({ username, password, email, dob }),
+    }),
+  guestLogin: () => {
+    clearAuthToken();
+    return request('/api/auth/guest', { method: 'POST', auth: false });
+  },
+  me: () => request('/api/auth/me'),
+  logout: () => request('/api/auth/logout', { method: 'POST' }),
 
-  // Settings
-  getSettings: (userId) => request(`/api/settings/${userId}`),
-  updateSettings: (userId, avKey, geminiKey) =>
+  // Settings. User IDs remain accepted by these wrappers for call-site
+  // compatibility, but identity is derived only from the bearer token.
+  getSettings: (_userId) => request('/api/settings'),
+  updateSettings: (_userId, avKey, geminiKey, options = {}) =>
     request('/api/settings', {
       method: 'POST',
-      body: JSON.stringify({ user_id: userId, av_key: avKey, gemini_key: geminiKey }),
+      body: JSON.stringify({
+        av_key: avKey || null,
+        gemini_key: geminiKey || null,
+        clear_av_key: Boolean(options.clearAvKey),
+        clear_gemini_key: Boolean(options.clearGeminiKey),
+      }),
     }),
 
   // Portfolio
-  getPortfolio: (userId) => request(`/api/portfolio/${userId}`),
-  addPortfolio: (userId, name, symbol, quantity, buyPrice) =>
+  getPortfolio: (_userId) => request('/api/portfolio'),
+  addPortfolio: (_userId, name, symbol, quantity, buyPrice) =>
     request('/api/portfolio', {
       method: 'POST',
-      body: JSON.stringify({ user_id: userId, name, symbol, quantity, buy_price: buyPrice }),
+      body: JSON.stringify({ name, symbol, quantity, buy_price: buyPrice }),
     }),
-  removePortfolio: (pid, userId) =>
-    request(`/api/portfolio/${pid}?user_id=${encodeURIComponent(userId)}`, { method: 'DELETE' }),
+  removePortfolio: (pid, _userId) => request(`/api/portfolio/${pid}`, { method: 'DELETE' }),
 
   // Watchlist
-  getWatchlist: (userId) => request(`/api/watchlist/${userId}`),
-  addWatchlist: (userId, name, symbol, alertPrice, alertDir) =>
+  getWatchlist: (_userId) => request('/api/watchlist'),
+  addWatchlist: (_userId, name, symbol, alertPrice, alertDir) =>
     request('/api/watchlist', {
       method: 'POST',
-      body: JSON.stringify({ user_id: userId, name, symbol, alert_price: alertPrice, alert_dir: alertDir }),
+      body: JSON.stringify({ name, symbol, alert_price: alertPrice, alert_dir: alertDir }),
     }),
-  removeWatchlist: (wid, userId) =>
-    request(`/api/watchlist/${wid}?user_id=${encodeURIComponent(userId)}`, { method: 'DELETE' }),
-  checkWatchlist: (userId, symbol) => request(`/api/watchlist/check/${userId}/${encodeURIComponent(symbol)}`),
-  toggleWatchlist: (userId, symbol, name) =>
+  removeWatchlist: (wid, _userId) => request(`/api/watchlist/${wid}`, { method: 'DELETE' }),
+  checkWatchlist: (_userId, symbol) =>
+    request(`/api/watchlist/check/${encodeURIComponent(symbol)}`),
+  toggleWatchlist: (_userId, symbol, name) =>
     request('/api/watchlist/toggle', {
       method: 'POST',
-      body: JSON.stringify({ user_id: userId, symbol, name }),
+      body: JSON.stringify({ symbol, name }),
     }),
 
-  // Trading (Paper / Virtual Trading Engine)
-  getTradingSummary: (userId) => request(`/api/trading/summary/${userId}`),
-  executeOrder: (userId, symbol, name, orderType, quantity, price) =>
+  // Trading (paper / virtual trading engine)
+  getTradingSummary: (_userId) => request('/api/trading/summary'),
+  executeOrder: (_userId, symbol, name, orderType, quantity, price) =>
     request('/api/trading/order', {
       method: 'POST',
-      body: JSON.stringify({ user_id: userId, symbol, name, order_type: orderType, quantity: parseFloat(quantity), price: parseFloat(price) }),
+      body: JSON.stringify({
+        symbol,
+        name,
+        order_type: orderType,
+        quantity: Number(quantity),
+        price: Number(price),
+      }),
     }),
 
-  // Market Data
-  getPrice: (symbol, avKey = '') =>
-    request(`/api/price/${encodeURIComponent(symbol)}?av_key=${encodeURIComponent(avKey)}`),
+  // Market data
+  getPrice: (symbol) => request(`/api/price/${encodeURIComponent(symbol)}`),
   getHistory: (symbol, period = '1y', interval = '') =>
     request(`/api/history/${encodeURIComponent(symbol)}?period=${encodeURIComponent(period)}${interval ? `&interval=${encodeURIComponent(interval)}` : ''}`),
   searchSymbols: (query) => request(`/api/search?q=${encodeURIComponent(query)}`),
 
   // AI
-  analyze: (userId, query) =>
-    request('/api/analyze', { method: 'POST', body: JSON.stringify({ user_id: userId, query }) }),
-  compare: (userId, stock1, stock2) =>
-    request('/api/compare', { method: 'POST', body: JSON.stringify({ user_id: userId, stock1, stock2 }) }),
+  analyze: (_userId, query) =>
+    request('/api/analyze', { method: 'POST', body: JSON.stringify({ query }) }),
+  compare: (_userId, stock1, stock2) =>
+    request('/api/compare', { method: 'POST', body: JSON.stringify({ stock1, stock2 }) }),
 
-  // AI Stock Screener
-  getRecommendations: (userId) =>
-    request(`/api/screener/recommendations?user_id=${encodeURIComponent(userId || 0)}`),
-  refreshRecommendations: (userId) =>
-    request(`/api/screener/refresh?user_id=${encodeURIComponent(userId || 0)}`, { method: 'POST' }),
+  // AI stock screener
+  getRecommendations: (_userId) => request('/api/screener/recommendations'),
+  refreshRecommendations: (_userId) =>
+    request('/api/screener/refresh', { method: 'POST' }),
 
-  // AI Intraday Sessions
-  saveAISession: (payload) =>
-    request('/api/ai-intraday/sessions', { method: 'POST', body: JSON.stringify(payload) }),
-  getAISessions: (userId, symbol) => {
-    const params = new URLSearchParams();
-    if (userId) params.append('user_id', userId);
-    if (symbol) params.append('symbol', symbol);
-    return request(`/api/ai-intraday/sessions?${params.toString()}`);
+  // AI intraday sessions. Ownership fields from UI state are deliberately
+  // removed; the backend binds every journal to the authenticated account.
+  saveAISession: (payload) => {
+    const { user_id: _snakeUser, userId: _camelUser, user: _user, ...session } = payload;
+    return request('/api/ai-intraday/sessions', {
+      method: 'POST',
+      body: JSON.stringify(session),
+    });
   },
-  getAISession: (sessionId) =>
+  getAISessions: (_userId, symbol) => {
+    const params = new URLSearchParams();
+    if (symbol) params.append('symbol', symbol);
+    const query = params.toString();
+    return request(`/api/ai-intraday/sessions${query ? `?${query}` : ''}`);
+  },
+  getAISession: (sessionId, _userId) =>
     request(`/api/ai-intraday/sessions/${encodeURIComponent(sessionId)}`),
 
-  // PDF (returns blob)
-  exportPdf: async (data) => {
-    const res = await fetch(`${API}/api/export-pdf`, {
+  exportPdf: (data) =>
+    requestBlob('/api/export-pdf', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: 'PDF export failed' }));
-      throw new Error(formatError(err.detail));
-    }
-    return res.blob();
-  },
+    }),
 };

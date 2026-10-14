@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useState, useEffect, useCallback } from 'react';
+import { motion as Motion, AnimatePresence } from 'framer-motion';
 import { Plus, X, Briefcase } from 'lucide-react';
 import { api } from '../api';
 
@@ -8,31 +8,56 @@ export default function PortfolioPage({ user }) {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ name: '', symbol: '', quantity: '', buy_price: '' });
   const [error, setError] = useState('');
+  const isGuest = user?.user_id === 'guest';
 
-  const fetchPortfolio = async () => {
-    if (user.user_id === 'guest') return;
+  const fetchPortfolio = useCallback(async () => {
+    if (!user?.user_id || isGuest) return;
     try {
       const res = await api.getPortfolio(user.user_id);
-      setPortfolio(res);
-    } catch { /* ignore */ }
-  };
+      setPortfolio(Array.isArray(res) ? res : []);
+    } catch (err) {
+      setError(err.message || 'Failed to load portfolio.');
+    }
+  }, [isGuest, user?.user_id]);
 
-  useEffect(() => { fetchPortfolio(); }, []);
+  useEffect(() => { void fetchPortfolio(); }, [fetchPortfolio]);
 
-  const total = portfolio.reduce((sum, h) => sum + h.quantity * h.buy_price, 0);
+  const total = portfolio.reduce((sum, holding) => {
+    const quantity = Number(holding.quantity);
+    const buyPrice = Number(holding.buy_price);
+    return Number.isFinite(quantity) && Number.isFinite(buyPrice)
+      ? sum + (quantity * buyPrice)
+      : sum;
+  }, 0);
 
   const handleAdd = async (e) => {
     e.preventDefault();
     setError('');
+    if (isGuest) {
+      setError('Please sign in to manage a portfolio.');
+      return;
+    }
     if (!form.name || !form.symbol || !form.quantity || !form.buy_price) {
       setError('Please fill in all fields.');
       return;
     }
+    const parsedQuantity = Number(form.quantity);
+    const parsedBuyPrice = Number(form.buy_price);
+    if (!Number.isFinite(parsedQuantity) || parsedQuantity <= 0 || !Number.isFinite(parsedBuyPrice) || parsedBuyPrice <= 0) {
+      setError('Quantity and buy price must both be positive numbers.');
+      return;
+    }
     try {
-      await api.addPortfolio(user.user_id, form.name, form.symbol, parseFloat(form.quantity), parseFloat(form.buy_price));
+      await api.addPortfolio(
+        user.user_id,
+        form.name.trim(),
+        form.symbol.trim().toUpperCase(),
+        parsedQuantity,
+        parsedBuyPrice,
+      );
       setForm({ name: '', symbol: '', quantity: '', buy_price: '' });
       setShowForm(false);
-      fetchPortfolio();
+      await fetchPortfolio();
     } catch (err) {
       setError(err.message);
     }
@@ -41,8 +66,10 @@ export default function PortfolioPage({ user }) {
   const handleRemove = async (pid) => {
     try {
       await api.removePortfolio(pid, user.user_id);
-      fetchPortfolio();
-    } catch { /* ignore */ }
+      await fetchPortfolio();
+    } catch (err) {
+      setError(err.message || 'Failed to remove holding.');
+    }
   };
 
   return (
@@ -57,7 +84,7 @@ export default function PortfolioPage({ user }) {
           <span style={{ fontSize: '0.7rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '1px' }}>Total Invested</span>
           <div style={{ fontSize: '1.5rem', fontWeight: 800, color: 'var(--gold)' }}>₹{total.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</div>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowForm(!showForm)} id="portfolio-add-btn">
+        <button className="btn btn-primary" onClick={() => setShowForm(!showForm)} id="portfolio-add-btn" disabled={isGuest}>
           <Plus size={16} /> Add Holding
         </button>
       </div>
@@ -65,7 +92,7 @@ export default function PortfolioPage({ user }) {
       {/* Add Form */}
       <AnimatePresence>
         {showForm && (
-          <motion.div
+          <Motion.div
             className="card mb-24"
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: 'auto' }}
@@ -98,7 +125,7 @@ export default function PortfolioPage({ user }) {
                 <button className="btn btn-ghost" type="button" onClick={() => setShowForm(false)}>Cancel</button>
               </div>
             </form>
-          </motion.div>
+          </Motion.div>
         )}
       </AnimatePresence>
 
@@ -111,17 +138,17 @@ export default function PortfolioPage({ user }) {
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           {portfolio.map((h, i) => (
-            <motion.div key={h.id} className="holding-row" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }}>
+            <Motion.div key={h.id} className="holding-row" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }}>
               <div className="name">{h.name}</div>
               <div className="sym"><span className="tag tag-gold">{h.symbol}</span></div>
               <div className="qty">Qty: {h.quantity}</div>
-              <div className="val">₹{(h.quantity * h.buy_price).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</div>
+              <div className="val">₹{((Number(h.quantity) || 0) * (Number(h.buy_price) || 0)).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</div>
               <div className="del">
                 <button className="btn btn-danger btn-sm" onClick={() => handleRemove(h.id)}>
                   <X size={14} />
                 </button>
               </div>
-            </motion.div>
+            </Motion.div>
           ))}
         </div>
       )}

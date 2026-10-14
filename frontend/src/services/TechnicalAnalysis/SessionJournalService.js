@@ -15,6 +15,14 @@ import { api } from '../../api';
 // ─── Local Storage Mirror Key ────────────────────────────────────
 const LOCAL_SESSIONS_KEY = 'etrade_ai_sessions';
 
+function normalizeUserId(userId) {
+  return userId === undefined || userId === null || userId === '' ? 'guest' : String(userId);
+}
+
+function getSessionOwner(session) {
+  return normalizeUserId(session?.user_id ?? session?.userId ?? session?.user);
+}
+
 // ─── Analytics Calculator ────────────────────────────────────────
 
 function calculateAnalytics(trades, startingCapital, endingCapital) {
@@ -350,34 +358,41 @@ function buildSessionPayload(accountOrOptions, symbolArg, timelineEventsArg, dec
   let symbol = symbolArg;
   let timelineEvents = timelineEventsArg;
   let decisions = decisionsArg;
-  let userId = userIdArg || 'guest';
+  let userId = normalizeUserId(userIdArg);
 
   let sessionId = null;
   let startTime = null;
+  let sessionStartingCapital = null;
 
   // Support options object signature: buildSessionPayload({ account, symbol, ... })
-  if (accountOrOptions && typeof accountOrOptions === 'object' && accountOrOptions.account) {
+  if (
+    accountOrOptions &&
+    typeof accountOrOptions === 'object' &&
+    Object.prototype.hasOwnProperty.call(accountOrOptions, 'account')
+  ) {
     account = accountOrOptions.account;
-    symbol = accountOrOptions.symbol || symbol;
-    timelineEvents = accountOrOptions.timelineEvents || timelineEvents;
-    decisions = accountOrOptions.decisions || decisions;
-    userId = accountOrOptions.userId || userId;
-    sessionId = accountOrOptions.sessionId || null;
-    startTime = accountOrOptions.startTime || null;
+    symbol = accountOrOptions.symbol ?? symbol;
+    timelineEvents = accountOrOptions.timelineEvents ?? timelineEvents;
+    decisions = accountOrOptions.decisions ?? decisions;
+    userId = normalizeUserId(accountOrOptions.userId ?? userId);
+    sessionId = accountOrOptions.sessionId ?? null;
+    startTime = accountOrOptions.startTime ?? null;
+    sessionStartingCapital = Number(accountOrOptions.startingCapital);
   }
 
   account = account || {};
-  const sessionIdentifier = sessionId || account.sessionId || `paper_${Date.now()}`;
-  const cleanSym = (symbol || '').toUpperCase().replace('.NS', '');
+  const cleanSym = String(symbol || '').trim().toUpperCase().replace(/\.NS$/, '');
+  const sessionIdentifier = sessionId || `session_${cleanSym || 'unknown'}_${Date.now()}`;
   const now = new Date().toISOString();
 
   // Extract closed trades from account for this specific session/symbol
   const closed = account.closedPositions || [];
   const sessionPositions = closed.filter(pos => {
-    if (sessionId && pos.sessionId) {
+    if (sessionId) {
+      // Never pull legacy/sibling trades into an explicitly identified run.
       return pos.sessionId === sessionId;
     }
-    const posSym = (pos.symbol || '').toUpperCase().replace('.NS', '');
+    const posSym = String(pos.symbol || '').toUpperCase().replace(/\.NS$/, '');
     return posSym === cleanSym;
   });
 
@@ -404,7 +419,9 @@ function buildSessionPayload(accountOrOptions, symbolArg, timelineEventsArg, dec
     partialExits: pos.partialExits || [],
   }));
 
-  const startingCapital = account.initialCapital || 100000;
+  const startingCapital = Number.isFinite(sessionStartingCapital) && sessionStartingCapital > 0
+    ? sessionStartingCapital
+    : (Number(account.initialCapital) || 100000);
   const sessionRealizedPnL = trades.reduce((sum, t) => sum + (t.realizedPnL || 0), 0);
   const endingCapital = startingCapital + sessionRealizedPnL;
   const analytics = calculateAnalytics(trades, startingCapital, endingCapital);
@@ -432,6 +449,7 @@ function buildSessionPayload(accountOrOptions, symbolArg, timelineEventsArg, dec
     analytics,
     trades: enrichedTrades,
     decisions: (decisions || []).slice(-100), // Keep last 100 decisions
+    timeline: (timelineEvents || []).slice(-500),
     created_at: now,
   };
 }
@@ -448,22 +466,33 @@ function getStorage() {
 
 function saveSessionLocally(session) {
   try {
+    const normalizedSession = {
+      ...session,
+      user_id: getSessionOwner(session),
+      userId: getSessionOwner(session),
+    };
+    const owner = getSessionOwner(normalizedSession);
     const storage = getStorage();
     if (!storage) {
-      const idx = memorySessionsFallback.findIndex(s => s.id === session.id);
-      if (idx >= 0) memorySessionsFallback[idx] = session;
-      else memorySessionsFallback.unshift(session);
+      const idx = memorySessionsFallback.findIndex(
+        s => s.id === normalizedSession.id && getSessionOwner(s) === owner
+      );
+      if (idx >= 0) memorySessionsFallback[idx] = normalizedSession;
+      else memorySessionsFallback.unshift(normalizedSession);
       return;
     }
     const stored = storage.getItem(LOCAL_SESSIONS_KEY);
-    const sessions = stored ? JSON.parse(stored) : [];
-    const idx = sessions.findIndex(s => s.id === session.id);
+    const parsed = stored ? JSON.parse(stored) : [];
+    const sessions = Array.isArray(parsed) ? parsed : [];
+    const idx = sessions.findIndex(
+      s => s.id === normalizedSession.id && getSessionOwner(s) === owner
+    );
     if (idx >= 0) {
-      sessions[idx] = session;
+      sessions[idx] = normalizedSession;
     } else {
-      sessions.unshift(session);
+      sessions.unshift(normalizedSession);
     }
-    if (sessions.length > 50) sessions.length = 50;
+    if (sessions.length > 200) sessions.length = 200;
     storage.setItem(LOCAL_SESSIONS_KEY, JSON.stringify(sessions));
   } catch (e) {
     console.warn('SessionJournalService: Failed to mirror session to localStorage', e);
@@ -475,7 +504,8 @@ function getLocalSessions() {
     const storage = getStorage();
     if (!storage) return memorySessionsFallback;
     const stored = storage.getItem(LOCAL_SESSIONS_KEY);
-    return stored ? JSON.parse(stored) : [];
+    const parsed = stored ? JSON.parse(stored) : [];
+    return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     console.warn('SessionJournalService: Failed to read localStorage', e);
     return [];
@@ -521,11 +551,18 @@ export const SessionJournalService = {
    * Falls back gracefully to localStorage-only if backend is offline.
    */
   async saveSession(session) {
+    if (!session?.id) throw new Error('A session id is required for journal persistence');
+    const normalizedSession = {
+      ...session,
+      user_id: getSessionOwner(session),
+      userId: getSessionOwner(session),
+      user: getSessionOwner(session),
+    };
     // Always mirror locally first
-    saveSessionLocally(session);
+    saveSessionLocally(normalizedSession);
 
     try {
-      const result = await api.saveAISession(session);
+      const result = await api.saveAISession(normalizedSession);
       return { saved: true, backendOk: true, result };
     } catch (err) {
       console.warn('SessionJournalService: Backend save failed, data mirrored locally', err);
@@ -538,14 +575,16 @@ export const SessionJournalService = {
    * Ensures data survives page refresh even if backend is down.
    */
   async getSessions(userId) {
-    const localSessions = getLocalSessions();
+    const owner = normalizeUserId(userId);
+    const localSessions = getLocalSessions().filter(session => getSessionOwner(session) === owner);
 
     try {
       const backendSessions = await api.getAISessions(userId);
       // Merge: backend is source of truth, but include local-only sessions
-      const backendIds = new Set((backendSessions || []).map(s => s.id));
+      const remote = Array.isArray(backendSessions) ? backendSessions : [];
+      const backendIds = new Set(remote.map(s => s.id));
       const localOnly = localSessions.filter(s => !backendIds.has(s.id));
-      const merged = [...(backendSessions || []), ...localOnly];
+      const merged = [...remote, ...localOnly];
       // Sort by created_at descending
       merged.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
       return merged;
@@ -558,7 +597,7 @@ export const SessionJournalService = {
   /**
    * Fetches a single session detail (backend first, localStorage fallback).
    */
-  async getSession(sessionId) {
+  async getSession(sessionId, userId) {
     try {
       const session = await api.getAISession(sessionId);
       if (session) return session;
@@ -566,8 +605,9 @@ export const SessionJournalService = {
       console.warn('SessionJournalService: Backend fetch failed, checking localStorage', err);
     }
 
+    const owner = normalizeUserId(userId);
     const localSessions = getLocalSessions();
-    return localSessions.find(s => s.id === sessionId) || null;
+    return localSessions.find(s => s.id === sessionId && getSessionOwner(s) === owner) || null;
   },
 
   /**

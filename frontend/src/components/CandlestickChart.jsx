@@ -6,13 +6,15 @@ export default function CandlestickChart({ data }) {
   const chartRef = useRef(null);
 
   useEffect(() => {
-    if (!containerRef.current || !data || data.length === 0) return;
+    if (!containerRef.current) return undefined;
 
     // Clean up previous chart
     if (chartRef.current) {
       chartRef.current.remove();
       chartRef.current = null;
     }
+
+    if (!Array.isArray(data) || data.length === 0) return undefined;
 
     const isIntraday = data.some(d => typeof d.time === 'number');
 
@@ -54,20 +56,28 @@ export default function CandlestickChart({ data }) {
 
     const formatted = [...data]
       .map((d) => ({
-        time: d.time || d.date,
-        open: d.open,
-        high: d.high,
-        low: d.low,
-        close: d.close,
+        time: d.time ?? d.date,
+        open: Number(d.open),
+        high: Number(d.high),
+        low: Number(d.low),
+        close: Number(d.close),
       }))
+      .filter((candle) => (
+        candle.time != null
+        && [candle.open, candle.high, candle.low, candle.close].every(Number.isFinite)
+        && candle.high >= Math.max(candle.open, candle.close)
+        && candle.low <= Math.min(candle.open, candle.close)
+      ))
       .sort((a, b) => {
         if (typeof a.time === 'number' && typeof b.time === 'number') return a.time - b.time;
         return new Date(a.time).getTime() - new Date(b.time).getTime();
       })
-      .filter((v, i, a) => i === 0 || v.time !== a[i - 1].time);
+      .filter((value, index, values) => index === 0 || value.time !== values[index - 1].time);
 
-    series.setData(formatted);
-    chart.timeScale().fitContent();
+    if (formatted.length > 0) {
+      series.setData(formatted);
+      chart.timeScale().fitContent();
+    }
     chartRef.current = chart;
 
     const handleResize = () => {
