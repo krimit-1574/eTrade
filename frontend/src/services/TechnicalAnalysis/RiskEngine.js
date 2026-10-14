@@ -48,6 +48,7 @@ export const REJECTION_CODES = {
   POOR_RISK_REWARD: 'POOR_RISK_REWARD',
   INVALID_STOP_LOSS: 'INVALID_STOP_LOSS',
   INSUFFICIENT_CAPITAL: 'INSUFFICIENT_CAPITAL',
+  MAX_TOTAL_EXPOSURE_REACHED: 'MAX_TOTAL_EXPOSURE_REACHED',
   STALE_DATA: 'STALE_DATA',
 };
 
@@ -186,11 +187,16 @@ export const RiskEngine = {
     const maxCapitalAllowed = totalEquity * (config.maxCapitalPerTradePct / 100);
     const maxAffordableByAllocation = Math.floor(maxCapitalAllowed / entryPrice);
 
-    // 5. Hard cash constraint (leaving ₹50 buffer for fees & slippage)
+    // 5. Total exposure constraint (Rule: maxTotalExposurePct, e.g. 80%)
+    const maxTotalExposurePct = config.maxTotalExposurePct !== undefined ? config.maxTotalExposurePct : 80;
+    const remainingExposure = Math.max(0, (totalEquity * maxTotalExposurePct / 100) - currentExposure);
+    const maxAffordableByExposure = Math.floor(remainingExposure / entryPrice);
+
+    // 6. Hard cash constraint (leaving ₹50 buffer for fees & slippage)
     const maxAffordableByCash = Math.floor(Math.max(0, cash - 50) / (entryPrice * 1.002));
 
-    // 6. Constrain quantity
-    let quantity = Math.min(rawQty, maxAffordableByAllocation, maxAffordableByCash);
+    // 7. Constrain quantity
+    let quantity = Math.min(rawQty, maxAffordableByAllocation, maxAffordableByExposure, maxAffordableByCash);
     quantity = Math.max(0, quantity);
 
     const capitalRequired = parseFloat((quantity * entryPrice).toFixed(2));
@@ -198,7 +204,8 @@ export const RiskEngine = {
 
     let constrainedBy = 'RISK_FORMULA';
     if (quantity === maxAffordableByAllocation && quantity < rawQty) constrainedBy = 'MAX_CAPITAL_ALLOCATION';
-    if (quantity === maxAffordableByCash && quantity < rawQty) constrainedBy = 'AVAILABLE_CASH';
+    if (quantity === maxAffordableByExposure && quantity < rawQty && quantity < maxAffordableByAllocation) constrainedBy = 'MAX_TOTAL_EXPOSURE';
+    if (quantity === maxAffordableByCash && quantity < rawQty && quantity < maxAffordableByExposure && quantity < maxAffordableByAllocation) constrainedBy = 'AVAILABLE_CASH';
 
     return {
       quantity,
@@ -207,7 +214,102 @@ export const RiskEngine = {
       perShareRisk: parseFloat(perShareRisk.toFixed(2)),
       capitalRequired,
       constrainedBy,
+      remainingExposure: parseFloat(remainingExposure.toFixed(2)),
     };
+  },
+
+  /**
+   * Policy: Determines whether general market operating hours (09:15-15:30) and weekend checks are bypassed.
+   */
+  shouldBypassMarketHours(settings = {}, marketState = null) {
+    return Boolean(settings?.bypassMarketHours || marketState?.bypassMarketHours);
+  },
+
+  /**
+   * Policy: Determines whether the 15:15 intraday square-off cutoff is bypassed.
+   * When bypassMarketHours is true, cutoff is automatically bypassed.
+   * When bypassCutoff is true, cutoff is explicitly bypassed.
+   */
+  shouldBypassCutoff(settings = {}, marketState = null) {
+    return Boolean(
+      settings?.bypassCutoff ||
+      settings?.bypassMarketHours ||
+      marketState?.bypassMarketHours
+    );
+  },
+
+  /**
+   * Policy: Checks market timing permissions for new trade entry.
+   * Returns { allowed: true } or { allowed: false, code, reason }.
+   */
+  checkMarketTimingForEntry({ settings = {}, marketState = null, currentTime = null }) {
+    const bypassHours = this.shouldBypassMarketHours(settings, marketState);
+    const bypassCutoff = this.shouldBypassCutoff(settings, marketState);
+
+    const now = currentTime ? new Date(currentTime) : new Date();
+    const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+    const ist = new Date(utc + (3600000 * 5.5));
+    const day = ist.getDay(); // 0 = Sun, 6 = Sat
+    const currentTimeNum = ist.getHours() * 100 + ist.getMinutes();
+
+    const [startH, startM] = (settings.tradingStartTime || '09:15').split(':').map(Number);
+    const [cutoffH, cutoffM] = (settings.intradayCutoffTime || '15:15').split(':').map(Number);
+    const startTimeNum = startH * 100 + startM;
+    const cutoffTimeNum = cutoffH * 100 + cutoffM;
+    const marketCloseTimeNum = 1530; // 15:30 IST regular close
+
+    // 1. Weekend check
+    if (!bypassHours && (day === 0 || day === 6)) {
+      return { allowed: false, code: REJECTION_CODES.MARKET_CLOSED, reason: 'Market is closed on weekends.' };
+    }
+
+    // 2. Pre-market start check
+    if (!bypassHours && currentTimeNum < startTimeNum) {
+      return { 
+        allowed: false, 
+        code: REJECTION_CODES.TRADING_NOT_STARTED, 
+        reason: `Trading session opens at ${settings.tradingStartTime || '09:15'} IST.` 
+      };
+    }
+
+    // 3. Regular market close check
+    if (!bypassHours && currentTimeNum >= marketCloseTimeNum) {
+      return { 
+        allowed: false, 
+        code: REJECTION_CODES.MARKET_CLOSED, 
+        reason: 'Regular trading session closed at 15:30 IST.' 
+      };
+    }
+
+    // 4. Intraday cutoff check (new entries blocked past 15:15 unless cutoff is bypassed)
+    if (!bypassCutoff && currentTimeNum >= cutoffTimeNum) {
+      return { 
+        allowed: false, 
+        code: REJECTION_CODES.CUTOFF_TIME_REACHED, 
+        reason: `Intraday cutoff reached (${settings.intradayCutoffTime || '15:15'} IST). No new positions permitted.` 
+      };
+    }
+
+    return { allowed: true };
+  },
+
+  /**
+   * Policy: Determines whether intraday cutoff square-off exit should be enforced.
+   * Returns true if square-off should be triggered, false if bypassed or before cutoff.
+   */
+  shouldEnforceCutoffExit({ settings = {}, marketState = null, currentTime = null }) {
+    if (this.shouldBypassCutoff(settings, marketState)) {
+      return false;
+    }
+
+    const now = currentTime ? new Date(currentTime) : new Date();
+    const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+    const ist = new Date(utc + (3600000 * 5.5));
+    const [cutoffH, cutoffM] = (settings?.intradayCutoffTime || '15:15').split(':').map(Number);
+    const currentNum = ist.getHours() * 100 + ist.getMinutes();
+    const cutoffNum = cutoffH * 100 + cutoffM;
+
+    return currentNum >= cutoffNum;
   },
 
   /**
@@ -223,39 +325,13 @@ export const RiskEngine = {
     }
 
     // 2. Market State: Hours & Cutoff Time (IST: UTC + 5:30)
-    const bypassMarketHours = marketState?.bypassMarketHours || settings.bypassMarketHours || customSettings?.bypassMarketHours;
-    if (!bypassMarketHours) {
-      const now = currentTime ? new Date(currentTime) : new Date();
-      const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
-      const ist = new Date(utc + (3600000 * 5.5));
-      const day = ist.getDay(); // 0 = Sun, 6 = Sat
-      const currentTimeNum = ist.getHours() * 100 + ist.getMinutes();
-
-      const [startH, startM] = (settings.tradingStartTime || '09:15').split(':').map(Number);
-      const [cutoffH, cutoffM] = (settings.intradayCutoffTime || '15:15').split(':').map(Number);
-      const startTimeNum = startH * 100 + startM;
-      const cutoffTimeNum = cutoffH * 100 + cutoffM;
-
-      // Weekend or explicit closed state
-      if (day === 0 || day === 6) {
-        return { approved: false, code: REJECTION_CODES.MARKET_CLOSED, reason: 'Market is closed on weekends.' };
-      }
-
-      if (currentTimeNum < startTimeNum) {
-        return { 
-          approved: false, 
-          code: REJECTION_CODES.TRADING_NOT_STARTED, 
-          reason: `Trading session opens at ${settings.tradingStartTime} IST.` 
-        };
-      }
-
-      if (currentTimeNum >= cutoffTimeNum) {
-        return { 
-          approved: false, 
-          code: REJECTION_CODES.CUTOFF_TIME_REACHED, 
-          reason: `Intraday cutoff reached (${settings.intradayCutoffTime} IST). No new positions permitted.` 
-        };
-      }
+    const timingCheck = this.checkMarketTimingForEntry({
+      settings,
+      marketState,
+      currentTime,
+    });
+    if (!timingCheck.allowed) {
+      return { approved: false, code: timingCheck.code, reason: timingCheck.reason };
     }
 
     // 3. Daily Loss Limit Check
@@ -382,19 +458,26 @@ export const RiskEngine = {
     }
 
     // 12. Position Sizing & Capital Feasibility
+    const currentExposure = account.usedCapital !== undefined
+      ? account.usedCapital
+      : (account.activePositions || []).reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
     const sizeResult = this.calculatePositionSize({
       accountValue: account.accountValue,
       availableCash: account.availableCash,
       entryPrice: decision.entry,
       stopLoss: decision.stopLoss,
       settings,
+      currentExposure,
     });
 
     if (sizeResult.quantity < 1) {
+      const isExposureConstraint = sizeResult.constrainedBy === 'MAX_TOTAL_EXPOSURE';
       return { 
         approved: false, 
-        code: REJECTION_CODES.INSUFFICIENT_CAPITAL, 
-        reason: `Calculated position size is 0 shares. Insufficient cash or risk allowance.` 
+        code: isExposureConstraint ? REJECTION_CODES.MAX_TOTAL_EXPOSURE_REACHED : REJECTION_CODES.INSUFFICIENT_CAPITAL, 
+        reason: isExposureConstraint
+          ? `Trade exceeds maximum total exposure allowance (${settings.maxTotalExposurePct || 80}%).`
+          : `Calculated position size is 0 shares. Insufficient cash or risk allowance.` 
       };
     }
 

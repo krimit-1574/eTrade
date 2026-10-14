@@ -12,6 +12,8 @@
  * - Intraday cutoff auto-exit at 15:15 IST
  */
 
+import { RiskEngine } from './RiskEngine.js';
+
 export const POSITION_DECISION = {
   HOLD: 'HOLD',
   PARTIAL_EXIT: 'PARTIAL_EXIT',
@@ -36,6 +38,7 @@ export const PositionManager = {
     technicalAnalysis,
     latestDecision,
     riskSettings,
+    currentTime,
   }) {
     if (!position || !currentPrice || currentPrice <= 0) {
       return { action: POSITION_DECISION.HOLD, reason: 'No active position or invalid price' };
@@ -61,23 +64,14 @@ export const PositionManager = {
     const priceDiff = direction === 'LONG' ? (currentPrice - entryPrice) : (entryPrice - currentPrice);
     const rMultiple = initialRiskDistance > 0 ? parseFloat((priceDiff / initialRiskDistance).toFixed(2)) : 0;
 
-    // 2. Intraday Cutoff Time Guard (15:15 IST)
-    if (!riskSettings?.bypassMarketHours && !riskSettings?.bypassCutoff) {
-      const now = new Date();
-      const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
-      const ist = new Date(utc + (3600000 * 5.5));
-      const [cutoffH, cutoffM] = (riskSettings?.intradayCutoffTime || '15:15').split(':').map(Number);
-      const currentNum = ist.getHours() * 100 + ist.getMinutes();
-      const cutoffNum = cutoffH * 100 + cutoffM;
-
-      if (currentNum >= cutoffNum) {
-        return {
-          action: POSITION_DECISION.EXIT,
-          reason: `Intraday cutoff reached (${riskSettings?.intradayCutoffTime || '15:15'} IST). Square-off enforced.`,
-          markerType: 'FINAL EXIT',
-          rMultiple,
-        };
-      }
+    // 2. Intraday Cutoff Time Guard (15:15 IST) - uses shared RiskEngine policy
+    if (RiskEngine.shouldEnforceCutoffExit({ settings: riskSettings, currentTime })) {
+      return {
+        action: POSITION_DECISION.EXIT,
+        reason: `Intraday cutoff reached (${riskSettings?.intradayCutoffTime || '15:15'} IST). Square-off enforced.`,
+        markerType: 'FINAL EXIT',
+        rMultiple,
+      };
     }
 
     // 3. Stop-Loss Breach Check

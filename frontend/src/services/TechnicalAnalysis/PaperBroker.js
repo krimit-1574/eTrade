@@ -69,7 +69,7 @@ export const PaperBroker = {
    * Creates and immediately fills a MARKET order (simulated).
    * @returns {{ account, order, position, events }} 
    */
-  executeMarketOrder(account, { symbol, direction, entry, stopLoss, target1, target2, setup, confidence, customQuantity }) {
+  executeMarketOrder(account, { symbol, direction, entry, stopLoss, target1, target2, setup, confidence, customQuantity, sessionId }) {
     const events = [];
     const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
 
@@ -90,7 +90,7 @@ export const PaperBroker = {
     const config = account.config || DEFAULT_BROKER_CONFIG;
     const maxSimultaneous = config.maxSimultaneousPositions !== undefined ? config.maxSimultaneousPositions : 1;
 
-    const existingPos = account.activePositions.find(p => p.symbol === cleanSym || p.symbol === symbol);
+    const existingPos = account.activePositions.find(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanSym || p.symbol === symbol);
     if (existingPos) {
       events.push({ 
         id: Date.now() + 1, 
@@ -152,6 +152,7 @@ export const PaperBroker = {
       stopLoss,
       target1,
       target2,
+      sessionId: sessionId || null,
       createdAt: new Date().toISOString(),
       filledAt: new Date().toISOString(),
     };
@@ -184,12 +185,15 @@ export const PaperBroker = {
       status: POSITION_STATUS.OPEN,
       entryTime: new Date().toISOString(),
       orderId: order.id,
+      sessionId: sessionId || null,
       setup,
     };
 
     account.activePositions.push(position);
-    account.activePosition = account.activePositions[0];
+    account.activePosition = account.activePositions[0] ?? null;
     account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
+    account.unrealizedPnL = account.activePositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
+    account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
     if (!account.orderHistory) account.orderHistory = [];
     account.orderHistory.push(order);
 
@@ -213,12 +217,24 @@ export const PaperBroker = {
   /**
    * Creates a simulated LIMIT order with ORDER_PENDING status.
    */
-  createLimitOrder(account, { symbol, direction, limitPrice, quantity, stopLoss, target1, target2, setup, confidence }) {
+  createLimitOrder(account, { symbol, direction, limitPrice, quantity, stopLoss, target1, target2, setup, confidence, sessionId }) {
     const events = [];
     const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
 
-    if (account.activePosition) {
-      events.push({ id: Date.now(), time: now(), title: 'Limit order rejected', detail: 'Active position already exists.', type: 'error' });
+    if (!account.activePositions) {
+      account.activePositions = account.activePosition ? [account.activePosition] : [];
+    }
+    const cleanSym = (symbol || '').toUpperCase().replace('.NS', '');
+    const config = account.config || DEFAULT_BROKER_CONFIG;
+    const maxSimultaneous = config.maxSimultaneousPositions !== undefined ? config.maxSimultaneousPositions : 1;
+
+    if (account.activePositions.length >= maxSimultaneous) {
+      events.push({ id: Date.now(), time: now(), title: 'Limit order rejected', detail: 'Maximum positions already reached.', type: 'error' });
+      return { account, order: null, events };
+    }
+
+    if (account.activePositions.some(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanSym || p.symbol === symbol)) {
+      events.push({ id: Date.now(), time: now(), title: 'Limit order rejected', detail: `Active position already exists for ${symbol}.`, type: 'error' });
       return { account, order: null, events };
     }
 
@@ -243,11 +259,13 @@ export const PaperBroker = {
       stopLoss,
       target1,
       target2,
+      sessionId: sessionId || null,
       createdAt: new Date().toISOString(),
     };
 
     if (!account.pendingOrders) account.pendingOrders = [];
     account.pendingOrders.push(order);
+    if (!account.orderHistory) account.orderHistory = [];
     account.orderHistory.push(order);
 
     events.push({
@@ -350,9 +368,16 @@ export const PaperBroker = {
   evaluatePendingOrders(account, currentPrice, high, low) {
     const events = [];
     const filledOrders = [];
-    if (!account.pendingOrders || account.pendingOrders.length === 0 || account.activePosition) {
+    if (!account.activePositions) {
+      account.activePositions = account.activePosition ? [account.activePosition] : [];
+    }
+    if (!account.pendingOrders || account.pendingOrders.length === 0) {
+      account.activePosition = account.activePositions[0] ?? null;
       return { account, filledOrders, events };
     }
+
+    const config = account.config || DEFAULT_BROKER_CONFIG;
+    const maxSimultaneous = config.maxSimultaneousPositions !== undefined ? config.maxSimultaneousPositions : 1;
 
     const candleHigh = high ?? currentPrice;
     const candleLow = low ?? currentPrice;
@@ -375,7 +400,10 @@ export const PaperBroker = {
         }
       }
 
-      if (isTriggered && !account.activePosition) {
+      const hasCapacity = account.activePositions.length < maxSimultaneous &&
+        !account.activePositions.some(p => (p.symbol || '').toUpperCase().replace('.NS', '') === (order.symbol || '').toUpperCase().replace('.NS', ''));
+
+      if (isTriggered && hasCapacity) {
         const fillPrice = parseFloat(calculateFillPrice(order.requestedPrice, order.direction, account.config).toFixed(2));
         const commission = account.config.commission || 0;
         const cost = fillPrice * order.quantity;
@@ -385,10 +413,9 @@ export const PaperBroker = {
         order.filledAt = new Date().toISOString();
 
         account.availableCash -= (cost + commission);
-        account.usedCapital = cost;
 
         const position = {
-          id: `POS_${Date.now()}`,
+          id: `POS_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
           symbol: order.symbol,
           direction: order.direction,
           quantity: order.quantity,
@@ -402,10 +429,16 @@ export const PaperBroker = {
           status: POSITION_STATUS.OPEN,
           entryTime: new Date().toISOString(),
           orderId: order.id,
+          sessionId: order.sessionId || null,
           setup: order.setup,
         };
 
-        account.activePosition = position;
+        account.activePositions.push(position);
+        account.activePosition = account.activePositions[0] ?? null;
+        account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
+        account.unrealizedPnL = account.activePositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
+        account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
+
         filledOrders.push(order);
 
         const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
@@ -422,6 +455,10 @@ export const PaperBroker = {
     }
 
     account.pendingOrders = remainingPending;
+    account.activePosition = account.activePositions[0] ?? null;
+    account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
+    account.unrealizedPnL = account.activePositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
+    account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
     PaperTradingAccount.save(account);
 
     return { account, filledOrders, events };
@@ -438,9 +475,11 @@ export const PaperBroker = {
     let pos = null;
     if (targetSymbol) {
       const cleanTarget = targetSymbol.toUpperCase().replace('.NS', '');
-      pos = account.activePositions.find(p => p.symbol === cleanTarget || p.symbol === targetSymbol);
-    }
-    if (!pos) {
+      pos = account.activePositions.find(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanTarget || p.symbol === targetSymbol);
+      if (!pos) {
+        return { account, closed: false, events: [] };
+      }
+    } else {
       pos = account.activePositions[0] || account.activePosition;
     }
 
@@ -490,11 +529,14 @@ export const PaperBroker = {
 
     if (targetSymbol) {
       const cleanTarget = targetSymbol.toUpperCase().replace('.NS', '');
-      posIndex = account.activePositions.findIndex(p => p.symbol === cleanTarget || p.symbol === targetSymbol);
-      if (posIndex >= 0) pos = account.activePositions[posIndex];
-    }
-
-    if (!pos) {
+      posIndex = account.activePositions.findIndex(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanTarget || p.symbol === targetSymbol);
+      if (posIndex >= 0) {
+        pos = account.activePositions[posIndex];
+      } else {
+        // Explicitly requested symbol is missing -> return without mutation
+        return { account, events, closedFully: false };
+      }
+    } else {
       if (account.activePositions.length > 0) {
         pos = account.activePositions[0];
         posIndex = 0;
@@ -530,7 +572,10 @@ export const PaperBroker = {
       if (pos.remainingQuantity !== undefined) {
         pos.remainingQuantity = pos.quantity;
       }
+      account.activePosition = account.activePositions[0] ?? null;
       account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
+      account.unrealizedPnL = account.activePositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
+      account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
 
       if (!pos.partialExits) pos.partialExits = [];
       pos.partialExits.push({
@@ -586,7 +631,7 @@ export const PaperBroker = {
       account.activePositions = account.activePositions.filter(p => p.id !== pos.id && p.symbol !== pos.symbol);
     }
 
-    account.activePosition = account.activePositions[0] || null;
+    account.activePosition = account.activePositions[0] ?? null;
     account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
     account.unrealizedPnL = account.activePositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
     account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
@@ -620,9 +665,11 @@ export const PaperBroker = {
     let pos = null;
     if (targetSymbol) {
       const cleanTarget = targetSymbol.toUpperCase().replace('.NS', '');
-      pos = account.activePositions.find(p => p.symbol === cleanTarget || p.symbol === targetSymbol);
-    }
-    if (!pos) {
+      pos = account.activePositions.find(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanTarget || p.symbol === targetSymbol);
+      if (!pos) {
+        return { account, updated: false, events };
+      }
+    } else {
       pos = account.activePositions[0] || account.activePosition;
     }
 

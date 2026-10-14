@@ -352,6 +352,9 @@ function buildSessionPayload(accountOrOptions, symbolArg, timelineEventsArg, dec
   let decisions = decisionsArg;
   let userId = userIdArg || 'guest';
 
+  let sessionId = null;
+  let startTime = null;
+
   // Support options object signature: buildSessionPayload({ account, symbol, ... })
   if (accountOrOptions && typeof accountOrOptions === 'object' && accountOrOptions.account) {
     account = accountOrOptions.account;
@@ -359,15 +362,27 @@ function buildSessionPayload(accountOrOptions, symbolArg, timelineEventsArg, dec
     timelineEvents = accountOrOptions.timelineEvents || timelineEvents;
     decisions = accountOrOptions.decisions || decisions;
     userId = accountOrOptions.userId || userId;
+    sessionId = accountOrOptions.sessionId || null;
+    startTime = accountOrOptions.startTime || null;
   }
 
   account = account || {};
-  const sessionId = account.sessionId || `paper_${Date.now()}`;
+  const sessionIdentifier = sessionId || account.sessionId || `paper_${Date.now()}`;
+  const cleanSym = (symbol || '').toUpperCase().replace('.NS', '');
   const now = new Date().toISOString();
 
-  // Extract closed trades from account
-  const trades = (account.closedPositions || []).map(pos => ({
-    symbol: pos.symbol || symbol,
+  // Extract closed trades from account for this specific session/symbol
+  const closed = account.closedPositions || [];
+  const sessionPositions = closed.filter(pos => {
+    if (sessionId && pos.sessionId) {
+      return pos.sessionId === sessionId;
+    }
+    const posSym = (pos.symbol || '').toUpperCase().replace('.NS', '');
+    return posSym === cleanSym;
+  });
+
+  const trades = sessionPositions.map(pos => ({
+    symbol: pos.symbol || cleanSym,
     direction: pos.direction,
     quantity: pos.quantity,
     entryPrice: pos.entryPrice,
@@ -390,8 +405,8 @@ function buildSessionPayload(accountOrOptions, symbolArg, timelineEventsArg, dec
   }));
 
   const startingCapital = account.initialCapital || 100000;
-  const realizedPnL = typeof account.realizedPnL === 'number' ? account.realizedPnL : 0;
-  const endingCapital = account.accountValue || (startingCapital + realizedPnL);
+  const sessionRealizedPnL = trades.reduce((sum, t) => sum + (t.realizedPnL || 0), 0);
+  const endingCapital = startingCapital + sessionRealizedPnL;
   const analytics = calculateAnalytics(trades, startingCapital, endingCapital);
 
   // Add explanations and retrospectives to each trade
@@ -402,17 +417,17 @@ function buildSessionPayload(accountOrOptions, symbolArg, timelineEventsArg, dec
   }));
 
   return {
-    id: sessionId,
+    id: sessionIdentifier,
     user_id: userId,
     userId: userId,
     user: userId,
-    symbol: (symbol || '').toUpperCase().replace('.NS', ''),
-    start_time: account.createdAt || now,
+    symbol: cleanSym,
+    start_time: startTime || account.createdAt || now,
     end_time: now,
     starting_capital: startingCapital,
     ending_capital: parseFloat(endingCapital.toFixed(2)),
     status: 'COMPLETED',
-    realized_pnl: parseFloat(realizedPnL.toFixed(2)),
+    realized_pnl: parseFloat(sessionRealizedPnL.toFixed(2)),
     trade_count: trades.length,
     analytics,
     trades: enrichedTrades,

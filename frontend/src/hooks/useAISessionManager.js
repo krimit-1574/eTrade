@@ -14,24 +14,26 @@ import { AISessionManager } from '../services/TechnicalAnalysis/AISessionManager
 import { PaperTradingAccount } from '../services/TechnicalAnalysis/PaperTradingAccount';
 import { RiskEngine } from '../services/TechnicalAnalysis/RiskEngine';
 
+let isManagerInitialized = false;
+
 /**
  * Hook: Subscribe to the full AISessionManager state.
  * Returns a snapshot that updates whenever the manager notifies.
  */
 export function useAISessionManager() {
   const [snapshot, setSnapshot] = useState(() => ({
-    sessions: {},
-    account: null,
-    marketContext: null,
-    activeCount: 0,
+    sessions: AISessionManager.sessions ? Object.fromEntries(
+      [...AISessionManager.sessions.entries()].map(([k, s]) => [k, { ...s }])
+    ) : {},
+    account: AISessionManager.account || null,
+    marketContext: AISessionManager.marketContext || null,
+    activeCount: AISessionManager.getActiveSessions ? AISessionManager.getActiveSessions().length : 0,
   }));
 
-  const initializedRef = useRef(false);
-
   useEffect(() => {
-    // Initialize the manager on first use
-    if (!initializedRef.current) {
-      initializedRef.current = true;
+    // Initialize the manager on first use only once across all hook mounts
+    if (!isManagerInitialized) {
+      isManagerInitialized = true;
       const account = PaperTradingAccount.load();
       const riskSettings = RiskEngine.loadSettings();
       AISessionManager.initialize(account, riskSettings);
@@ -57,6 +59,10 @@ export function useAISessionManager() {
 
   const stopAllSessions = useCallback(async () => {
     return AISessionManager.stopAllSessions();
+  }, []);
+
+  const refreshSession = useCallback(async (symbol) => {
+    return AISessionManager.refreshSession(symbol);
   }, []);
 
   const manualClosePosition = useCallback(async (symbol) => {
@@ -86,6 +92,7 @@ export function useAISessionManager() {
     startSession,
     stopSession,
     stopAllSessions,
+    refreshSession,
     manualClosePosition,
     changeTimeframe,
     updateRiskSettings,
@@ -100,7 +107,7 @@ export function useAISessionManager() {
  * Hook: Subscribe to a single session's state by symbol.
  */
 export function useAISession(symbol) {
-  const { snapshot, stopSession, manualClosePosition, changeTimeframe } = useAISessionManager();
+  const { snapshot, stopSession, manualClosePosition, changeTimeframe, refreshSession } = useAISessionManager();
 
   const cleanSymbol = (symbol || '').toUpperCase().replace('.NS', '');
   const session = snapshot.sessions?.[cleanSymbol] || null;
@@ -122,5 +129,6 @@ export function useAISession(symbol) {
     stopSession: () => stopSession(cleanSymbol),
     closePosition: () => manualClosePosition(cleanSymbol),
     changeTimeframe: (tf) => changeTimeframe(cleanSymbol, tf),
+    refreshSession: () => refreshSession(cleanSymbol),
   };
 }

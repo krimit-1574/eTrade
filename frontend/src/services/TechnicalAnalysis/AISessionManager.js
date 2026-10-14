@@ -883,7 +883,9 @@ class AISessionManagerSingleton {
         const { account: updated, events } = PaperBroker.closePosition(
           this.account,
           session.price,
-          'Manual exit by trader'
+          'Manual exit by trader',
+          null,
+          cleanSymbol
         );
         this.account = updated;
         this._saveAccount();
@@ -907,6 +909,17 @@ class AISessionManagerSingleton {
 
     session.timeframe = newTimeframe;
     this._fetchCandles(cleanSymbol);
+  }
+
+  /**
+   * Manually refresh price quote and candles for a session.
+   */
+  async refreshSession(symbol) {
+    const cleanSymbol = (symbol || '').toUpperCase().replace('.NS', '');
+    await Promise.allSettled([
+      this._fetchPrice(cleanSymbol),
+      this._fetchCandles(cleanSymbol),
+    ]);
   }
 
   // ─── Cleanup ──────────────────────────────────────────────────

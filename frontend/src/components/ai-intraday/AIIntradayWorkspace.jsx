@@ -66,491 +66,118 @@ function getIndianMarketState() {
 }
 
 export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) {
-  const cleanSymbol = (symbol || 'RELIANCE').toUpperCase();
+  const cleanSymbol = (symbol || 'RELIANCE').toUpperCase().replace('.NS', '');
   const formattedSymbol = cleanSymbol.includes('.') ? cleanSymbol : `${cleanSymbol}.NS`;
 
   // Multi-session hooks and view state
-  const { sessions, activeCount, startSession, stopSession: stopSessionInManager } = useAISessionManager();
-  const { session: activeSessionState } = useAISession(cleanSymbol);
-  const [viewMode, setViewMode] = useState('FOCUS'); // 'FOCUS' or 'MULTI_GRID'
+  const { sessions, activeCount, startSession, stopSession: stopSessionInManager, account: managerAccount, updateRiskSettings } = useAISessionManager();
+  const {
+    session,
+    isActive,
+    status,
+    price,
+    chartData: sessionChartData,
+    markers: sessionMarkersFromHook,
+    timeline: sessionTimeline,
+    tradeLevels: sessionTradeLevels,
+    positionSummary,
+    technicalAnalysis: sessionTechnicalAnalysis,
+    tradeDecision: sessionTradeDecision,
+    isStaleData: sessionIsStaleData,
+    stopSession,
+    closePosition,
+    changeTimeframe,
+    refreshSession,
+  } = useAISession(cleanSymbol);
 
+  const [viewMode, setViewMode] = useState('FOCUS'); // 'FOCUS' or 'MULTI_GRID'
   const marketState = getIndianMarketState();
 
-  const [stockInfo, setStockInfo] = useState({
-    sym: cleanSymbol.replace('.NS', ''),
+  // Dynamically derived stock info — updates whenever symbol or session changes (no stale useState!)
+  const stockInfo = useMemo(() => ({
+    sym: cleanSymbol,
     ticker: formattedSymbol,
-    name: `${cleanSymbol.replace('.NS', '')} (NSE India)`,
-    price: 0,
-    change: 0,
-    changePct: 0,
+    name: `${cleanSymbol} (NSE India)`,
+    price: session?.price || 0,
+    change: session?.change || 0,
+    changePct: session?.changePct || 0,
     marketStatus: marketState.status,
-  });
+  }), [cleanSymbol, formattedSymbol, session?.price, session?.change, session?.changePct, marketState.status]);
 
-  const [timeframe, setTimeframe] = useState('5m');
-  const [chartData, setChartData] = useState([]);
-  const [isChartLoading, setIsChartLoading] = useState(true);
-  const [aiStatus, setAiStatus] = useState('MONITORING');
-  const [sessionStartTime] = useState(() => new Date().toLocaleTimeString('en-US', { hour12: true }));
-  const [error, setError] = useState(null);
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [technicalAnalysis, setTechnicalAnalysis] = useState(null);
-  const [tradeDecision, setTradeDecision] = useState(null);
-  const [timelineEvents, setTimelineEvents] = useState([
-    {
-      id: 1,
-      time: sessionStartTime,
-      title: 'AI session opened',
-      detail: `Initialized dedicated intraday trading workspace for ${cleanSymbol}.`,
-      type: 'info',
-    }
-  ]);
+  const [timeframe, setTimeframe] = useState(() => session?.timeframe || '5m');
+  const currentTimeframe = session?.timeframe || timeframe;
 
-  // Paper Trading State (Persisted in sessionStorage)
-  const [paperAccount, setPaperAccount] = useState(() => PaperTradingAccount.load());
-  const hasExecutedRef = useRef(false);
-
-  // Risk Management Settings & Modal
   const [riskSettings, setRiskSettings] = useState(() => RiskEngine.loadSettings());
   const [isRiskModalOpen, setIsRiskModalOpen] = useState(false);
 
-  // Trade Markers History for Chart Overlay
-  const [sessionMarkers, setSessionMarkers] = useState([]);
-
-  // Session Journaling & Overview Modal (Part 9)
-  const sessionDecisionsRef = useRef([]);
+  // Session Journaling & Overview Modal
   const [isSessionModalOpen, setIsSessionModalOpen] = useState(false);
   const [currentSessionData, setCurrentSessionData] = useState(null);
 
-  // Market & Sector Context & Stale Data Guards (Part 10)
-  const [marketContext, setMarketContext] = useState(null);
-  const [isStaleData, setIsStaleData] = useState(false);
-  const sectorInfo = useMemo(() => MarketContextService.getSectorForStock(cleanSymbol), [cleanSymbol]);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
-  const isMounted = useRef(true);
-  const pollingTimerRef = useRef(null);
+  // Authoritative paper account from AISessionManager
+  const account = managerAccount || PaperTradingAccount.load();
+  const currentPosition = (account?.activePositions || []).find(p => p.symbol === cleanSymbol) ||
+    (account?.activePosition?.symbol === cleanSymbol ? account.activePosition : null);
 
-  // Load benchmark market indices context
+  const chartData = sessionChartData || session?.chartData || [];
+  const isChartLoading = chartData.length === 0 && isActive;
+  const aiStatus = session?.status || (isActive ? 'RUNNING' : 'STOPPED');
+  const isStaleData = sessionIsStaleData || session?.isStaleData || false;
+  const technicalAnalysis = sessionTechnicalAnalysis || session?.technicalAnalysis || null;
+  const tradeDecision = sessionTradeDecision || session?.tradeDecision || null;
+  const timelineEvents = sessionTimeline || session?.timeline || [];
+  const markers = sessionMarkersFromHook || session?.markers || [];
+  const tradeLevels = sessionTradeLevels || session?.tradeLevels || null;
+
+  // Auto-start background session if not already created
+  const startedRef = useRef(new Set());
   useEffect(() => {
-    MarketContextService.fetchMarketIndices().then(res => {
-      if (isMounted.current && res) setMarketContext(res);
-    }).catch(err => console.warn('Workspace: market context load error:', err));
-  }, []);
-
-  // Fetch Live Price & Metadata
-  const fetchLiveQuote = useCallback(async () => {
-    try {
-      const res = await api.getPrice(formattedSymbol);
-      if (res && res.price !== 'N/A' && isMounted.current) {
-        setIsStaleData(false);
-        setStockInfo((prev) => ({
-          ...prev,
-          price: parseFloat(res.price || 0),
-          change: parseFloat(res.change || 0),
-          changePct: parseFloat(res.pct || 0),
-        }));
-      } else if (isMounted.current) {
-        setIsStaleData(true);
-      }
-    } catch (err) {
-      console.warn('Workspace: fetchLiveQuote error:', err);
-      if (isMounted.current) setIsStaleData(true);
+    if (!sessions[cleanSymbol] && !startedRef.current.has(cleanSymbol)) {
+      startedRef.current.add(cleanSymbol);
+      startSession(cleanSymbol, { timeframe: currentTimeframe });
     }
-  }, [formattedSymbol]);
-
-  // Fetch OHLCV Candlestick History
-  const fetchCandleData = useCallback(async (selectedTf = timeframe, force = false) => {
-    if (force) setIsRefreshing(true);
-    else setIsChartLoading(true);
-    setError(null);
-
-    try {
-      const config = TIMEFRAME_CONFIG[selectedTf] || TIMEFRAME_CONFIG['5m'];
-      const res = await api.getHistory(formattedSymbol, config.period, config.interval);
-
-      if (isMounted.current) {
-        if (res && Array.isArray(res.data) && res.data.length > 0) {
-          setChartData(res.data);
-          // Run analysis engine with market context (Part 10)
-          const analysis = SetupAnalyzer.analyze(stockInfo.sym, res.data, marketContext);
-          setTechnicalAnalysis(analysis);
-          setIsStaleData(false);
-        } else {
-          // If 1m is empty (off-hours), fallback to 5m/15m
-          const fallbackRes = await api.getHistory(formattedSymbol, '5d', '15m');
-          if (fallbackRes && Array.isArray(fallbackRes.data)) {
-            setChartData(fallbackRes.data);
-            const fallbackAnalysis = SetupAnalyzer.analyze(stockInfo.sym, fallbackRes.data, marketContext);
-            setTechnicalAnalysis(fallbackAnalysis);
-            setIsStaleData(false);
-          }
-        }
-      }
-    } catch (err) {
-      console.error('Workspace: fetchCandleData error:', err);
-      if (isMounted.current) {
-        setError('Unable to retrieve intraday candle stream. Showing latest cached session.');
-        setIsStaleData(true);
-      }
-    } finally {
-      if (isMounted.current) {
-        setIsChartLoading(false);
-        setIsRefreshing(false);
-      }
-    }
-  }, [formattedSymbol, timeframe, marketContext]);
-
-  useEffect(() => {
-    isMounted.current = true;
-    fetchLiveQuote();
-    fetchCandleData(timeframe);
-
-    // Light polling every 10 seconds for intraday price updates
-    pollingTimerRef.current = setInterval(() => {
-      fetchLiveQuote();
-    }, 10000);
-
-    return () => {
-      isMounted.current = false;
-      if (pollingTimerRef.current) {
-        clearInterval(pollingTimerRef.current);
-        pollingTimerRef.current = null;
-      }
-    };
-  }, [fetchLiveQuote, fetchCandleData, timeframe]);
-
-  // Evaluate Trading Decision when analysis or price changes
-  useEffect(() => {
-    if (technicalAnalysis && stockInfo.price > 0 && isMounted.current) {
-      try {
-        const decision = AITradingDecisionEngine.evaluate(technicalAnalysis, stockInfo.price, marketContext);
-        setTradeDecision(decision);
-
-        // Update AI Status based on decision and state (Part 10 State Matrix)
-        if (paperAccount.activePosition) {
-          setAiStatus('POSITION ACTIVE');
-        } else if (isStaleData || error) {
-          setAiStatus('DATA DISCONNECTED');
-        } else if (decision.decision === 'BUY' || decision.decision === 'SHORT') {
-          setAiStatus('RUNNING');
-        } else if (decision.invalidation && decision.invalidation.includes('waiting')) {
-          setAiStatus('WAITING FOR CONFIRMATION');
-        } else {
-          setAiStatus('WAITING');
-        }
-
-        // Add timeline event if setup is found
-        if (decision.decision !== 'WAIT') {
-          setTimelineEvents(prev => {
-            const lastEvent = prev[prev.length - 1];
-            if (lastEvent && lastEvent.title.includes(decision.decision)) return prev;
-
-            return [...prev, {
-              id: Date.now(),
-              time: new Date().toLocaleTimeString('en-US', { hour12: true }),
-              title: `${decision.decision} Setup Validated`,
-              detail: `Detected ${decision.setup.replace(/_/g, ' ')}. Confidence: ${decision.confidence}%. Entry: ₹${decision.entry}.`,
-              type: 'active'
-            }];
-          });
-        }
-
-        // MANDATORY RISK ENGINE VETO GATE
-        // The AI Strategy Engine CANNOT bypass the Risk Engine
-        if ((decision.decision === 'BUY' || decision.decision === 'SHORT') && !paperAccount.activePosition && !hasExecutedRef.current) {
-          hasExecutedRef.current = true;
-
-          // Stale Data Guard (Rule 16 / Task 6)
-          if (isStaleData || error) {
-            setTimelineEvents(prev => [...prev, {
-              id: Date.now(),
-              time: new Date().toLocaleTimeString('en-US', { hour12: true }),
-              title: 'Trade Blocked: Stale Data / Disconnected',
-              detail: 'Market connection has an active error or stale quote. Order creation prevented. [STALE_DATA]',
-              type: 'error',
-            }]);
-            setAiStatus('DATA DISCONNECTED');
-            return;
-          }
-
-          const validation = RiskEngine.validateTrade({
-            account: paperAccount,
-            decision,
-            stockInfo,
-            customSettings: riskSettings,
-          });
-
-          // Record major AI decision for session journaling (Part 9)
-          sessionDecisionsRef.current.push({
-            decision: decision.decision,
-            direction: decision.direction,
-            setup: decision.setup,
-            confidence: decision.confidence,
-            entry: decision.entry,
-            stopLoss: decision.stopLoss,
-            target1: decision.target1,
-            target2: decision.target2,
-            price: stockInfo.price,
-            timestamp: new Date().toISOString(),
-            accepted: validation.approved,
-            rejectionReason: validation.approved ? null : `${validation.reason} [${validation.code}]`,
-          });
-
-          if (!validation.approved) {
-            // Trade VETOED by Risk Engine
-            setTimelineEvents(prev => [...prev, {
-              id: Date.now(),
-              time: new Date().toLocaleTimeString('en-US', { hour12: true }),
-              title: 'Trade Rejected by Risk Engine',
-              detail: `Reason: ${validation.reason} [${validation.code}]`,
-              type: 'error',
-            }]);
-            setAiStatus('RISK LIMIT REACHED');
-            return;
-          }
-
-          // Approved: Execute with Risk-Engine calculated position sizing
-          const { account: updatedAccount, events: orderEvents } = PaperBroker.executeMarketOrder(paperAccount, {
-            symbol: stockInfo.sym,
-            direction: decision.direction,
-            entry: decision.entry,
-            stopLoss: decision.stopLoss,
-            target1: decision.target1,
-            target2: decision.target2,
-            setup: decision.setup,
-            confidence: decision.confidence,
-            customQuantity: validation.quantity,
-          });
-
-          // Record initial BUY/SHORT entry marker on chart
-          const latestCandle = chartData[chartData.length - 1];
-          const candleTime = latestCandle?.time || latestCandle?.date;
-          if (candleTime && updatedAccount.activePosition) {
-            setSessionMarkers(prev => [...prev, {
-              time: candleTime,
-              position: decision.direction === 'LONG' ? 'belowBar' : 'aboveBar',
-              color: decision.direction === 'LONG' ? '#10B981' : '#EF4444',
-              shape: decision.direction === 'LONG' ? 'arrowUp' : 'arrowDown',
-              text: `${decision.direction === 'LONG' ? 'BUY' : 'SHORT'} @ ₹${updatedAccount.activePosition.entryPrice}`,
-            }]);
-          }
-
-          setPaperAccount({ ...updatedAccount });
-          setTimelineEvents(prev => [...prev, ...orderEvents]);
-          setAiStatus('POSITION OPEN');
-        }
-
-        // Reset execution flag when decision goes back to WAIT
-        if (decision.decision === 'WAIT') {
-          hasExecutedRef.current = false;
-        }
-      } catch (err) {
-        console.error('Workspace: DecisionEngine evaluate error:', err);
-        setAiStatus('WAITING');
-      }
-    }
-  }, [technicalAnalysis, stockInfo.price, riskSettings, error, chartData, isStaleData, paperAccount.activePosition]);
-
-  // Autonomous Position Lifecycle & Order Evaluation on each price tick / candle
-  useEffect(() => {
-    if (paperAccount.activePosition && stockInfo.price > 0) {
-      let currentAccount = PaperTradingAccount.updateMarketPrice({ ...paperAccount }, stockInfo.price);
-      const pos = currentAccount.activePosition;
-
-      // Run PositionManager autonomous lifecycle evaluation
-      const evaluation = PositionManager.evaluatePosition({
-        position: pos,
-        currentPrice: stockInfo.price,
-        candleHigh: stockInfo.dayHigh,
-        candleLow: stockInfo.dayLow,
-        technicalAnalysis,
-        latestDecision: tradeDecision,
-        riskSettings,
-      });
-
-      const latestCandle = chartData[chartData.length - 1];
-      const candleTime = latestCandle?.time || latestCandle?.date;
-
-      if (evaluation.action === POSITION_DECISION.PARTIAL_EXIT) {
-        // Take partial profit (e.g. 50% scale-out at Target 1)
-        const exitResult = PaperBroker.closePosition(currentAccount, stockInfo.price, evaluation.reason, evaluation.exitQuantity);
-        currentAccount = exitResult.account;
-        setTimelineEvents(prev => [...prev, ...exitResult.events]);
-
-        // Auto move stop to breakeven after partial profit taken
-        const beStop = pos.direction === 'LONG' ? parseFloat((pos.entryPrice * 1.0005).toFixed(2)) : parseFloat((pos.entryPrice * 0.9995).toFixed(2));
-        const beResult = PaperBroker.updateStopLoss(currentAccount, beStop, 'Stop moved to break-even');
-        if (beResult.updated) {
-          currentAccount = beResult.account;
-          currentAccount.activePosition.breakevenMoved = true;
-          setTimelineEvents(prev => [...prev, ...beResult.events]);
-        }
-
-        if (candleTime) {
-          setSessionMarkers(prev => [...prev, {
-            time: candleTime,
-            position: pos.direction === 'LONG' ? 'aboveBar' : 'belowBar',
-            color: '#F59E0B',
-            shape: 'circle',
-            text: `PARTIAL: ${evaluation.exitQuantity} @ ₹${exitResult.fillPrice}`,
-          }]);
-        }
-      } else if (evaluation.action === POSITION_DECISION.MOVE_TO_BREAKEVEN) {
-        // Move Stop Loss to Break-Even
-        const updateResult = PaperBroker.updateStopLoss(currentAccount, evaluation.newStop, 'Stop moved to break-even');
-        if (updateResult.updated) {
-          currentAccount = updateResult.account;
-          currentAccount.activePosition.breakevenMoved = true;
-          setTimelineEvents(prev => [...prev, ...updateResult.events]);
-        }
-      } else if (evaluation.action === POSITION_DECISION.TRAIL_STOP) {
-        // Ratchet Trailing Stop
-        const updateResult = PaperBroker.updateStopLoss(currentAccount, evaluation.newStop, 'Trailing stop ratcheted');
-        if (updateResult.updated) {
-          currentAccount = updateResult.account;
-          setTimelineEvents(prev => [...prev, ...updateResult.events]);
-        }
-      } else if (evaluation.action === POSITION_DECISION.TAKE_PROFIT || evaluation.action === POSITION_DECISION.EXIT) {
-        // Full liquidation
-        const exitResult = PaperBroker.closePosition(currentAccount, stockInfo.price, evaluation.reason);
-        currentAccount = exitResult.account;
-        setTimelineEvents(prev => [...prev, ...exitResult.events]);
-        setAiStatus(StrategyConfig.STATUS_WAITING);
-
-        if (candleTime) {
-          const isTarget = evaluation.markerType === 'TARGET';
-          const isStop = evaluation.markerType === 'STOP';
-          setSessionMarkers(prev => [...prev, {
-            time: candleTime,
-            position: pos.direction === 'LONG' ? 'aboveBar' : 'belowBar',
-            color: isTarget ? '#10B981' : (isStop ? '#EF4444' : '#64748B'),
-            shape: isStop ? 'square' : 'circle',
-            text: `${evaluation.markerType}: ${pos.symbol} @ ₹${exitResult.fillPrice}`,
-          }]);
-        }
-      }
-
-      PaperTradingAccount.save(currentAccount);
-      setPaperAccount(currentAccount);
-    } else if (paperAccount.pendingOrders?.length > 0 && stockInfo.price > 0) {
-      // Evaluate pending limit / stop orders
-      const { account: afterPending, filledOrders, events: pendingEvents } = PaperBroker.evaluatePendingOrders(
-        { ...paperAccount },
-        stockInfo.price,
-        stockInfo.dayHigh,
-        stockInfo.dayLow
-      );
-      if (filledOrders.length > 0) {
-        setTimelineEvents(prev => [...prev, ...pendingEvents]);
-        setAiStatus('POSITION OPEN');
-        setPaperAccount(afterPending);
-      }
-    }
-  }, [stockInfo.price, stockInfo.dayHigh, stockInfo.dayLow, technicalAnalysis, tradeDecision, riskSettings, chartData]);
-
-  // Handle manual position exit from UI
-  const handleClosePosition = useCallback(() => {
-    if (paperAccount.activePosition && stockInfo.price > 0) {
-      const { account: updated, events } = PaperBroker.closePosition(paperAccount, stockInfo.price, 'Manual exit by trader');
-      setPaperAccount({ ...updated });
-      setTimelineEvents(prev => [...prev, ...events]);
-      setAiStatus(StrategyConfig.STATUS_WAITING);
-    }
-  }, [paperAccount, stockInfo.price]);
-
-  // Chart markers for entry order
-  const chartMarkers = useMemo(() => {
-    const list = [];
-    if (paperAccount.activePosition && chartData.length > 0) {
-      const pos = paperAccount.activePosition;
-      const latestCandle = chartData[chartData.length - 1];
-      const candleTime = latestCandle?.time || latestCandle?.date;
-      if (candleTime) {
-        list.push({
-          time: candleTime,
-          position: pos.direction === 'LONG' ? 'belowBar' : 'aboveBar',
-          color: pos.direction === 'LONG' ? '#10B981' : '#EF4444',
-          shape: pos.direction === 'LONG' ? 'arrowUp' : 'arrowDown',
-          text: `${pos.direction === 'LONG' ? 'BUY' : 'SHORT'} @ ₹${pos.entryPrice}`,
-        });
-      }
-    }
-    return list;
-  }, [paperAccount.activePosition, chartData]);
-
-  // Trade levels for chart overlay (Entry, SL, T1, T2)
-  const tradeLevels = useMemo(() => {
-    if (paperAccount.activePosition) {
-      return {
-        entry: paperAccount.activePosition.entryPrice,
-        stopLoss: paperAccount.activePosition.stopLoss,
-        target1: paperAccount.activePosition.target1,
-        target2: paperAccount.activePosition.target2,
-        direction: paperAccount.activePosition.direction,
-      };
-    }
-    if (tradeDecision && tradeDecision.decision !== 'WAIT' && tradeDecision.entry) {
-      return {
-        entry: tradeDecision.entry,
-        stopLoss: tradeDecision.stopLoss,
-        target1: tradeDecision.target1,
-        target2: tradeDecision.target2,
-        direction: tradeDecision.direction,
-      };
-    }
-    return null;
-  }, [paperAccount.activePosition, tradeDecision]);
+  }, [cleanSymbol, sessions, startSession, currentTimeframe]);
 
   const handleTimeframeChange = (newTf) => {
     setTimeframe(newTf);
-    fetchCandleData(newTf);
+    changeTimeframe(newTf);
+  };
+
+  const handleClosePosition = useCallback(() => {
+    closePosition();
+  }, [closePosition]);
+
+  const handleStopAI = async () => {
+    const sessionData = await stopSession();
+    if (sessionData) {
+      setCurrentSessionData(sessionData);
+      setIsSessionModalOpen(true);
+    }
   };
 
   const handleOpenSessionModal = () => {
-    const session = SessionJournalService.buildSessionPayload({
-      account: paperAccount,
-      symbol: stockInfo.sym,
-      decisions: sessionDecisionsRef.current,
+    const sessionPayload = SessionJournalService.buildSessionPayload({
+      account,
+      symbol: cleanSymbol,
+      decisions: session?.decisions || [],
       userId: 'guest',
+      sessionId: session?.id,
+      startTime: session?.startedAt,
     });
-    setCurrentSessionData(session);
+    setCurrentSessionData(sessionPayload);
     setIsSessionModalOpen(true);
   };
 
-  const handleStopAI = async () => {
-    setAiStatus('STOPPED');
-    isMounted.current = false;
-    if (pollingTimerRef.current) {
-      clearInterval(pollingTimerRef.current);
-      pollingTimerRef.current = null;
-    }
-
-    let finalAccount = paperAccount;
-    // If active paper position exists, close it immediately before stopping
-    if (paperAccount.activePosition && stockInfo.price > 0) {
-      const { account: closedAccount, events } = PaperBroker.closePosition(
-        paperAccount,
-        stockInfo.price,
-        'AI session manually stopped by user.'
-      );
-      PaperTradingAccount.save(closedAccount);
-      setPaperAccount(closedAccount);
-      setTimelineEvents(prev => [...prev, ...events]);
-      finalAccount = closedAccount;
-    }
-
-    // Build complete session summary and persist
+  const handleSync = async () => {
+    setIsRefreshing(true);
     try {
-      const session = SessionJournalService.buildSessionPayload({
-        account: finalAccount,
-        symbol: stockInfo.sym,
-        decisions: sessionDecisionsRef.current,
-        userId: 'guest',
-      });
-      setCurrentSessionData(session);
-      setIsSessionModalOpen(true);
-      await SessionJournalService.saveSession(session);
+      await refreshSession();
     } catch (err) {
-      console.warn('AIIntradayWorkspace: Failed to persist session on stop', err);
+      console.warn('Workspace sync failed:', err);
+    } finally {
+      setIsRefreshing(false);
     }
   };
 
@@ -570,10 +197,7 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
           </span>
           <button
             className="btn btn-ghost btn-sm"
-            onClick={() => {
-              fetchLiveQuote();
-              fetchCandleData(timeframe, true);
-            }}
+            onClick={handleSync}
             disabled={isRefreshing}
             title="Refresh chart and market stream"
           >
@@ -962,10 +586,7 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
               </div>
               <button
                 className="btn btn-sm btn-ghost"
-                onClick={() => {
-                  fetchLiveQuote();
-                  fetchCandleData(timeframe, true);
-                }}
+                onClick={handleSync}
                 disabled={isRefreshing}
                 style={{ border: '1px solid rgba(239, 68, 68, 0.4)', color: '#EF4444', display: 'flex', alignItems: 'center', gap: '6px' }}
               >
@@ -977,20 +598,20 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
 
           {/* Intraday Risk Management Monitor Strip */}
           <AIIntradayRiskBar
-            account={paperAccount}
+            account={account}
             riskSettings={riskSettings}
             calculatedSizing={useMemo(() => {
               if (tradeDecision && tradeDecision.decision !== 'WAIT' && tradeDecision.entry && tradeDecision.stopLoss) {
                 return RiskEngine.calculatePositionSize({
-                  accountValue: paperAccount.accountValue,
-                  availableCash: paperAccount.availableCash,
+                  accountValue: account.accountValue,
+                  availableCash: account.availableCash,
                   entryPrice: tradeDecision.entry,
                   stopLoss: tradeDecision.stopLoss,
                   settings: riskSettings,
                 });
               }
               return null;
-            }, [tradeDecision, paperAccount.accountValue, paperAccount.availableCash, riskSettings])}
+            }, [tradeDecision, account.accountValue, account.availableCash, riskSettings])}
             onOpenSettings={() => setIsRiskModalOpen(true)}
           />
 
@@ -999,9 +620,9 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
             <AIIntradayChart
               data={chartData}
               isLoading={isChartLoading}
-              activeTimeframe={timeframe}
+              activeTimeframe={currentTimeframe}
               onTimeframeChange={handleTimeframeChange}
-              markers={[...sessionMarkers, ...chartMarkers]}
+              markers={markers}
               tradeLevels={tradeLevels}
             />
           </div>
@@ -1020,8 +641,8 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
 
             {/* Panel 2: Current Position */}
             <AIIntradayPositionPanel
-              position={paperAccount.activePosition}
-              account={paperAccount}
+              position={currentPosition}
+              account={account}
               onClosePosition={handleClosePosition}
             />
 
@@ -1031,7 +652,7 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
             {/* Panel 4: Trade Timeline */}
             <AIIntradayTimelinePanel
               symbol={stockInfo.sym}
-              sessionTime={sessionStartTime}
+              sessionTime={session?.startedAt ? new Date(session.startedAt).toLocaleTimeString('en-US', { hour12: true }) : ''}
               events={timelineEvents}
             />
           </div>
@@ -1044,10 +665,12 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
             onSave={(newSettings) => {
               const saved = RiskEngine.saveSettings(newSettings);
               setRiskSettings(saved);
+              updateRiskSettings(saved);
             }}
             onReset={() => {
               const defaults = RiskEngine.resetSettings();
               setRiskSettings(defaults);
+              updateRiskSettings(defaults);
             }}
           />
 
