@@ -405,7 +405,7 @@ function buildSessionPayload(accountOrOptions, symbolArg, timelineEventsArg, dec
     entryTime: pos.entryTime,
     exitTime: pos.exitTime,
     stopLoss: pos.stopLoss,
-    initialStop: pos.initialStop || pos.stopLoss,
+    initialStop: pos.initialStopLoss ?? pos.initialStop ?? pos.stopLoss,
     finalStop: pos.stopLoss,
     target1: pos.target1,
     target2: pos.target2,
