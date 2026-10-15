@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion as Motion, AnimatePresence } from 'framer-motion';
 import { api } from '../api';
 
 export default function AuthScreen({ onLogin }) {
@@ -89,7 +89,7 @@ export default function AuthScreen({ onLogin }) {
   return (
     <div className="auth-wrapper">
       <AnimatePresence mode="wait">
-        <motion.div
+        <Motion.div
           key={tab}
           className="auth-card"
           initial={{ opacity: 0, y: 15 }}
@@ -234,7 +234,7 @@ export default function AuthScreen({ onLogin }) {
               </button>
             )}
           </form>
-        </motion.div>
+        </Motion.div>
       </AnimatePresence>
     </div>
   );

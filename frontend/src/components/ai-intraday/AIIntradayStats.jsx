@@ -9,7 +9,6 @@ export default function AIIntradayStats({
   todayPnL = 0,
   todayTrades = 0,
   activePositions = 0,
-  marketStatusNote = '',
   onAiStateChange,
 }) {
   const isMarketOpen = (marketStatus || '').toUpperCase() === 'OPEN';

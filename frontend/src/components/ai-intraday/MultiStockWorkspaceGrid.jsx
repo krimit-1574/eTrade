@@ -129,7 +129,7 @@ export default function MultiStockWorkspaceGrid({
                     {isPositive ? '+' : ''}{session.changePct?.toFixed(2)}%
                   </span>
                 </div>
-                <AIStatusBadge status={session.status} size="sm" />
+              <AIStatusBadge state={session.status} size="sm" />
               </div>
 
               {/* Right: Quick Actions (Expand, Minimize, Stop) */}

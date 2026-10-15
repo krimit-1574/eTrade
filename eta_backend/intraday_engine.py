@@ -149,8 +149,11 @@ def analyze_single_stock(item: dict) -> dict | None:
         delta = df_15m["Close"].diff()
         gain = delta.where(delta > 0, 0).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / (loss + 1e-9)
+        rs = gain / loss.replace(0, np.nan)
         rsi_series = 100 - (100 / (1 + rs))
+        rsi_series = rsi_series.mask((gain == 0) & (loss == 0), 50)
+        rsi_series = rsi_series.mask((gain > 0) & (loss == 0), 100)
+        rsi_series = rsi_series.mask((gain == 0) & (loss > 0), 0)
         rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty and not pd.isna(rsi_series.iloc[-1]) else 50.0
 
         # ATR calculation (14 period)

@@ -74,6 +74,7 @@ function getBrokerConfig(account) {
 
 function ensureAccountState(account) {
   if (!account || typeof account !== 'object') return false;
+  PaperTradingAccount.rolloverDaily(account);
   if (!Array.isArray(account.activePositions)) account.activePositions = [];
   if (account.activePositions.length === 0 && account.activePosition && account.activePosition.status !== POSITION_STATUS.CLOSED) {
     account.activePositions.push(account.activePosition);
@@ -121,6 +122,156 @@ function normalizeOptionalPrice(value) {
   return positivePrice(value);
 }
 
+function hasValidTradeLevels(direction, entry, stopLoss, target1, target2) {
+  if (!normalizeDirection(direction) || positivePrice(entry) === null) return false;
+  if (stopLoss !== null && (direction === 'LONG' ? stopLoss >= entry : stopLoss <= entry)) return false;
+  if (target1 !== null && (direction === 'LONG' ? target1 <= entry : target1 >= entry)) return false;
+  if (target2 !== null && (direction === 'LONG' ? target2 <= entry : target2 >= entry)) return false;
+  if (target1 !== null && target2 !== null && (direction === 'LONG' ? target2 <= target1 : target2 >= target1)) return false;
+  return true;
+}
+
+function calculateRiskReward(direction, entryPrice, stopLoss, target1, reportedRiskReward = null) {
+  const entry = positivePrice(entryPrice);
+  const stop = positivePrice(stopLoss);
+  const target = positivePrice(target1);
+  const reported = finiteNumber(reportedRiskReward);
+  let calculated = null;
+
+  if (
+    entry !== null
+    && stop !== null
+    && target !== null
+    && normalizeDirection(direction)
+    && hasValidTradeLevels(direction, entry, stop, target, null)
+  ) {
+    const riskDistance = Math.abs(entry - stop);
+    calculated = riskDistance > 0
+      ? Math.abs(target - entry) / riskDistance
+      : null;
+  }
+
+  const conservativeRatio = calculated !== null && reported !== null && reported >= 0
+    ? Math.min(calculated, reported)
+    : (calculated ?? (reported !== null && reported >= 0 ? reported : null));
+  return conservativeRatio === null ? null : parseFloat(conservativeRatio.toFixed(2));
+}
+
+function estimateOrderCommitment(order, config) {
+  const price = positivePrice(order?.requestedPrice);
+  const quantity = normalizeRequestedQuantity(order?.quantity);
+  if (price === null || quantity <= 0) return 0;
+  const slippage = Math.max(0, finiteNumber(order?.slippage, config.slippage));
+  const spread = Math.max(0, finiteNumber(order?.spread, config.spread));
+  const commission = Math.max(0, finiteNumber(order?.commission, config.commission));
+  const adverseFillPrice = price * (1 + slippage + (spread / 2));
+  return (adverseFillPrice * quantity) + commission;
+}
+
+function pendingCommitment(account, config) {
+  return (account.pendingOrders || []).reduce(
+    (sum, order) => sum + (order.status === ORDER_STATUS.PENDING ? estimateOrderCommitment(order, config) : 0),
+    0,
+  );
+}
+
+function createPendingOrder(account, type, params = {}) {
+  const events = [];
+  const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
+  if (!ensureAccountState(account)) return { account, order: null, events };
+
+  const cleanSym = normalizeSymbol(params.symbol);
+  const direction = normalizeDirection(params.direction);
+  const requestedPrice = positivePrice(type === 'LIMIT' ? params.limitPrice : params.stopPrice);
+  const stopLoss = normalizeOptionalPrice(params.stopLoss);
+  const target1 = normalizeOptionalPrice(params.target1);
+  const target2 = normalizeOptionalPrice(params.target2);
+  const optionalPriceIsInvalid = (raw, normalized) => raw != null && normalized === null;
+
+  if (
+    !cleanSym
+    || !direction
+    || requestedPrice === null
+    || optionalPriceIsInvalid(params.stopLoss, stopLoss)
+    || optionalPriceIsInvalid(params.target1, target1)
+    || optionalPriceIsInvalid(params.target2, target2)
+    || !hasValidTradeLevels(direction, requestedPrice, stopLoss, target1, target2)
+  ) {
+    events.push({ id: createId('EVT'), time: now(), title: `${type} order rejected`, detail: 'Invalid symbol, direction, or order prices.', type: 'error' });
+    return { account, order: null, events };
+  }
+
+  if (account.activePositions.some(position => normalizeSymbol(position.symbol) === cleanSym)
+      || account.pendingOrders.some(order => order.status === ORDER_STATUS.PENDING && normalizeSymbol(order.symbol) === cleanSym)) {
+    events.push({ id: createId('EVT'), time: now(), title: `${type} order rejected`, detail: `An active or pending order already exists for ${cleanSym}.`, type: 'error' });
+    return { account, order: null, events };
+  }
+
+  const config = getBrokerConfig(account);
+  const anticipatedFill = calculateFillPrice(requestedPrice, direction, config);
+  if (anticipatedFill === null || !hasValidTradeLevels(direction, anticipatedFill, stopLoss, target1, target2)) {
+    events.push({ id: createId('EVT'), time: now(), title: `${type} order rejected`, detail: 'Slippage would invalidate the protective stop or target levels.', type: 'error' });
+    return { account, order: null, events };
+  }
+  if (account.activePositions.length + account.pendingOrders.filter(order => order.status === ORDER_STATUS.PENDING).length >= config.maxSimultaneousPositions) {
+    events.push({ id: createId('EVT'), time: now(), title: `${type} order rejected`, detail: 'Maximum positions and pending entries already reached.', type: 'error' });
+    return { account, order: null, events };
+  }
+
+  const remainingCash = Math.max(0, account.availableCash - pendingCommitment(account, config));
+  const rawQuantity = params.quantity == null
+    ? calculateQuantity({ ...account, availableCash: remainingCash, config }, requestedPrice)
+    : normalizeRequestedQuantity(params.quantity);
+  const quantityWasInvalid = params.quantity != null
+    && (finiteNumber(params.quantity) === null || finiteNumber(params.quantity) !== rawQuantity);
+
+  if (rawQuantity <= 0 || quantityWasInvalid) {
+    events.push({ id: createId('EVT'), time: now(), title: `${type} order rejected`, detail: 'Quantity must be a positive whole number.', type: 'error' });
+    return { account, order: null, events };
+  }
+
+  const proposedOrder = { requestedPrice, quantity: rawQuantity };
+  if (estimateOrderCommitment(proposedOrder, config) > remainingCash) {
+    events.push({ id: createId('EVT'), time: now(), title: `${type} order rejected`, detail: 'Insufficient uncommitted paper balance.', type: 'error' });
+    return { account, order: null, events };
+  }
+
+  const order = {
+    id: createId('ORD'),
+    symbol: cleanSym,
+    direction,
+    type,
+    requestedPrice,
+    fillPrice: null,
+    quantity: rawQuantity,
+    commission: config.commission,
+    slippage: config.slippage,
+    spread: config.spread,
+    status: ORDER_STATUS.PENDING,
+    setup: params.setup || null,
+    confidence: finiteNumber(params.confidence),
+    riskReward: calculateRiskReward(direction, anticipatedFill, stopLoss, target1, params.riskReward),
+    stopLoss,
+    target1,
+    target2,
+    sessionId: params.sessionId || null,
+    createdAt: new Date().toISOString(),
+  };
+
+  account.pendingOrders.push(order);
+  account.orderHistory.push(order);
+  events.push({
+    id: createId('EVT'),
+    time: now(),
+    title: `${type} ${direction} Order Placed`,
+    detail: `${rawQuantity} ${cleanSym} @ â‚¹${requestedPrice}. Status: PENDING.`,
+    type: 'info',
+  });
+
+  PaperTradingAccount.save(account);
+  return { account, order, events };
+}
+
 // ------- Helper: calculate simulated fill price -------
 function calculateFillPrice(requestedPrice, direction, config = {}) {
   const price = positivePrice(requestedPrice);
@@ -162,7 +313,7 @@ export const PaperBroker = {
    * Creates and immediately fills a MARKET order (simulated).
    * @returns {{ account, order, position, events }} 
    */
-  executeMarketOrder(account, { symbol, direction, entry, stopLoss, target1, target2, setup, confidence, customQuantity, sessionId } = {}) {
+  executeMarketOrder(account, { symbol, direction, entry, stopLoss, target1, target2, setup, confidence, riskReward, customQuantity, sessionId } = {}) {
     const events = [];
     const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
 
@@ -182,9 +333,7 @@ export const PaperBroker = {
         invalidOptionalPrice(stopLoss, normalizedStop) ||
         invalidOptionalPrice(target1, normalizedTarget1) ||
         invalidOptionalPrice(target2, normalizedTarget2) ||
-        (normalizedStop !== null && (normalizedDirection === 'LONG' ? normalizedStop >= requestedEntry : normalizedStop <= requestedEntry)) ||
-        (normalizedTarget1 !== null && (normalizedDirection === 'LONG' ? normalizedTarget1 <= requestedEntry : normalizedTarget1 >= requestedEntry)) ||
-        (normalizedTarget2 !== null && (normalizedDirection === 'LONG' ? normalizedTarget2 <= requestedEntry : normalizedTarget2 >= requestedEntry))) {
+        !hasValidTradeLevels(normalizedDirection, requestedEntry, normalizedStop, normalizedTarget1, normalizedTarget2)) {
       events.push({ id: Date.now(), time: now(), title: 'Order rejected', detail: 'Invalid symbol, direction, quantity, or trade prices.', type: 'error' });
       return { account, order: null, position: null, events };
     }
@@ -214,12 +363,13 @@ export const PaperBroker = {
       return { account, order: null, position: existingPos, events };
     }
 
-    if (account.pendingOrders.some(order => normalizeSymbol(order.symbol) === cleanSym)) {
+    if (account.pendingOrders.some(order => order.status === ORDER_STATUS.PENDING && normalizeSymbol(order.symbol) === cleanSym)) {
       events.push({ id: Date.now() + 1, time: now(), title: 'Order rejected', detail: `A pending order for ${cleanSym} already exists.`, type: 'error' });
       return { account, order: null, position: null, events };
     }
 
-    if (account.activePositions.length >= maxSimultaneous) {
+    const activePendingCount = account.pendingOrders.filter(order => order.status === ORDER_STATUS.PENDING).length;
+    if (account.activePositions.length + activePendingCount >= maxSimultaneous) {
       events.push({ 
         id: Date.now() + 1, 
         time: now(), 
@@ -233,21 +383,45 @@ export const PaperBroker = {
     // 3. Determine quantity
     const hasCustomQuantity = customQuantity !== null && customQuantity !== undefined;
     let quantity = hasCustomQuantity ? normalizeRequestedQuantity(customQuantity) : calculateQuantity(account, requestedEntry);
-    if (hasCustomQuantity && quantity <= 0) {
+    const parsedCustomQuantity = hasCustomQuantity ? finiteNumber(customQuantity) : null;
+    if (hasCustomQuantity && (quantity <= 0 || parsedCustomQuantity !== quantity)) {
       events.push({ id: Date.now() + 2, time: now(), title: 'Order rejected', detail: 'Quantity must be a positive whole number.', type: 'error' });
       return { account, order: null, position: null, events };
     }
     const commission = config.commission;
+    const uncommittedCash = Math.max(0, account.availableCash - pendingCommitment(account, config));
+    if (!hasCustomQuantity) {
+      quantity = calculateQuantity({ ...account, availableCash: uncommittedCash, config }, requestedEntry);
+    }
     const fillPrice = parseFloat(calculateFillPrice(requestedEntry, normalizedDirection, config).toFixed(2));
+    if (!hasValidTradeLevels(normalizedDirection, fillPrice, normalizedStop, normalizedTarget1, normalizedTarget2)) {
+      events.push({ id: createId('EVT'), time: now(), title: 'Order rejected', detail: 'Slippage would invalidate the protective stop or target levels.', type: 'error' });
+      return { account, order: null, position: null, events };
+    }
 
-    // If slippage slightly pushed totalCost over available cash, scale down quantity
-    while (quantity > 1 && (fillPrice * quantity + commission) > account.availableCash) {
+    // A risk-approved/custom quantity is an instruction, not a suggestion. If it
+    // cannot be funded after simulated execution costs, reject it instead of
+    // silently opening a smaller position than the risk/audit trail records.
+    if (hasCustomQuantity && (fillPrice * quantity + commission) > uncommittedCash) {
+      events.push({
+        id: createId('EVT'),
+        time: now(),
+        title: 'Order rejected',
+        detail: 'Insufficient paper balance for the requested quantity.',
+        type: 'error',
+      });
+      return { account, order: null, position: null, events };
+    }
+
+    // Auto-sized orders may be reduced if execution costs consume the small
+    // affordability buffer between the quote and the simulated fill.
+    while (!hasCustomQuantity && quantity > 1 && (fillPrice * quantity + commission) > uncommittedCash) {
       quantity--;
     }
     const totalCost = (fillPrice * quantity) + commission;
 
     // Validate: sufficient cash
-    if (quantity <= 0 || totalCost > account.availableCash) {
+    if (quantity <= 0 || totalCost > uncommittedCash) {
       events.push({ 
         id: Date.now() + 2, 
         time: now(), 
@@ -267,10 +441,12 @@ export const PaperBroker = {
       requestedPrice: requestedEntry,
       fillPrice,
       quantity,
+      originalQuantity: quantity,
       commission,
       status: ORDER_STATUS.FILLED,
       setup,
-      confidence,
+      confidence: finiteNumber(confidence),
+      riskReward: calculateRiskReward(normalizedDirection, fillPrice, normalizedStop, normalizedTarget1, riskReward),
       stopLoss: normalizedStop,
       target1: normalizedTarget1,
       target2: normalizedTarget2,
@@ -299,6 +475,7 @@ export const PaperBroker = {
       symbol: cleanSym,
       direction: normalizedDirection,
       quantity,
+      originalQuantity: quantity,
       entryPrice: fillPrice,
       currentPrice: fillPrice,
       stopLoss: normalizedStop !== null ? parseFloat(normalizedStop.toFixed(2)) : null,
@@ -315,6 +492,8 @@ export const PaperBroker = {
       orderId: order.id,
       sessionId: sessionId || null,
       setup,
+      confidence: finiteNumber(confidence),
+      riskReward: calculateRiskReward(normalizedDirection, fillPrice, normalizedStop, normalizedTarget1, riskReward),
     };
 
     account.activePositions.push(position);
@@ -326,12 +505,12 @@ export const PaperBroker = {
       id: Date.now() + 4, 
       time: now(), 
       title: `${dirLabel} ${quantity} ${symbol} @ ₹${fillPrice}`, 
-      detail: `Commission: ₹${commission}. Fill includes ${(account.config.slippage * 100).toFixed(2)}% slippage.`, 
+      detail: `Commission: ₹${commission}. Fill includes ${(config.slippage * 100).toFixed(2)}% slippage.`,
       type: 'success' 
     });
 
-    if (stopLoss) events.push({ id: Date.now() + 5, time: now(), title: `Stop Loss set @ ₹${stopLoss.toFixed(2)}`, detail: 'Automatic stop-loss placed.', type: 'info' });
-    if (target1) events.push({ id: Date.now() + 6, time: now(), title: `Target 1 set @ ₹${target1.toFixed(2)}`, detail: `Risk/Reward defined`, type: 'info' });
+    if (normalizedStop !== null) events.push({ id: createId('EVT'), time: now(), title: `Stop Loss set @ ₹${normalizedStop.toFixed(2)}`, detail: 'Automatic stop-loss placed.', type: 'info' });
+    if (normalizedTarget1 !== null) events.push({ id: createId('EVT'), time: now(), title: `Target 1 set @ ₹${normalizedTarget1.toFixed(2)}`, detail: 'Risk/Reward defined', type: 'info' });
 
     PaperTradingAccount.save(account);
 
@@ -341,119 +520,15 @@ export const PaperBroker = {
   /**
    * Creates a simulated LIMIT order with ORDER_PENDING status.
    */
-  createLimitOrder(account, { symbol, direction, limitPrice, quantity, stopLoss, target1, target2, setup, confidence, sessionId }) {
-    const events = [];
-    const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
-
-    if (!account.activePositions) {
-      account.activePositions = account.activePosition ? [account.activePosition] : [];
-    }
-    const cleanSym = (symbol || '').toUpperCase().replace('.NS', '');
-    const config = account.config || DEFAULT_BROKER_CONFIG;
-    const maxSimultaneous = config.maxSimultaneousPositions !== undefined ? config.maxSimultaneousPositions : 1;
-
-    if (account.activePositions.length >= maxSimultaneous) {
-      events.push({ id: Date.now(), time: now(), title: 'Limit order rejected', detail: 'Maximum positions already reached.', type: 'error' });
-      return { account, order: null, events };
-    }
-
-    if (account.activePositions.some(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanSym || p.symbol === symbol)) {
-      events.push({ id: Date.now(), time: now(), title: 'Limit order rejected', detail: `Active position already exists for ${symbol}.`, type: 'error' });
-      return { account, order: null, events };
-    }
-
-    const qty = quantity && quantity > 0 ? quantity : calculateQuantity(account, limitPrice);
-    if (qty <= 0 || (limitPrice * qty > account.availableCash)) {
-      events.push({ id: Date.now(), time: now(), title: 'Limit order rejected', detail: 'Insufficient paper balance.', type: 'error' });
-      return { account, order: null, events };
-    }
-
-    const order = {
-      id: `ORD_${Date.now()}`,
-      symbol,
-      direction,
-      type: 'LIMIT',
-      requestedPrice: limitPrice,
-      fillPrice: null,
-      quantity: qty,
-      commission: account.config.commission || 0,
-      status: ORDER_STATUS.PENDING,
-      setup,
-      confidence,
-      stopLoss,
-      target1,
-      target2,
-      sessionId: sessionId || null,
-      createdAt: new Date().toISOString(),
-    };
-
-    if (!account.pendingOrders) account.pendingOrders = [];
-    account.pendingOrders.push(order);
-    if (!account.orderHistory) account.orderHistory = [];
-    account.orderHistory.push(order);
-
-    events.push({
-      id: Date.now() + 1,
-      time: now(),
-      title: `Limit ${direction} Order Placed`,
-      detail: `${qty} ${symbol} @ ₹${limitPrice}. Status: PENDING.`,
-      type: 'info'
-    });
-
-    PaperTradingAccount.save(account);
-    return { account, order, events };
+  createLimitOrder(account, params = {}) {
+    return createPendingOrder(account, 'LIMIT', params);
   },
 
   /**
    * Creates a simulated STOP order with ORDER_PENDING status.
    */
-  createStopOrder(account, { symbol, direction, stopPrice, quantity, stopLoss, target1, target2, setup, confidence }) {
-    const events = [];
-    const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
-
-    if (account.activePosition) {
-      events.push({ id: Date.now(), time: now(), title: 'Stop order rejected', detail: 'Active position already exists.', type: 'error' });
-      return { account, order: null, events };
-    }
-
-    const qty = quantity && quantity > 0 ? quantity : calculateQuantity(account, stopPrice);
-    if (qty <= 0 || (stopPrice * qty > account.availableCash)) {
-      events.push({ id: Date.now(), time: now(), title: 'Stop order rejected', detail: 'Insufficient paper balance.', type: 'error' });
-      return { account, order: null, events };
-    }
-
-    const order = {
-      id: `ORD_${Date.now()}`,
-      symbol,
-      direction,
-      type: 'STOP',
-      requestedPrice: stopPrice,
-      fillPrice: null,
-      quantity: qty,
-      commission: account.config.commission || 0,
-      status: ORDER_STATUS.PENDING,
-      setup,
-      confidence,
-      stopLoss,
-      target1,
-      target2,
-      createdAt: new Date().toISOString(),
-    };
-
-    if (!account.pendingOrders) account.pendingOrders = [];
-    account.pendingOrders.push(order);
-    account.orderHistory.push(order);
-
-    events.push({
-      id: Date.now() + 1,
-      time: now(),
-      title: `Stop ${direction} Order Placed`,
-      detail: `${qty} ${symbol} triggered at ₹${stopPrice}. Status: PENDING.`,
-      type: 'info'
-    });
-
-    PaperTradingAccount.save(account);
-    return { account, order, events };
+  createStopOrder(account, params = {}) {
+    return createPendingOrder(account, 'STOP', params);
   },
 
   /**
@@ -463,7 +538,9 @@ export const PaperBroker = {
     const events = [];
     const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
 
-    if (!account.pendingOrders) account.pendingOrders = [];
+    if (!ensureAccountState(account) || typeof orderId !== 'string' || !orderId) {
+      return { account, order: null, events };
+    }
     const idx = account.pendingOrders.findIndex(o => o.id === orderId);
     if (idx === -1) {
       return { account, order: null, events };
@@ -472,6 +549,7 @@ export const PaperBroker = {
     const order = account.pendingOrders[idx];
     order.status = ORDER_STATUS.CANCELLED;
     order.cancelledAt = new Date().toISOString();
+    syncOrderHistory(account, order);
     account.pendingOrders.splice(idx, 1);
 
     events.push({
@@ -489,102 +567,160 @@ export const PaperBroker = {
   /**
    * Evaluates pending orders against current candle or price.
    */
-  evaluatePendingOrders(account, currentPrice, high, low) {
+  evaluatePendingOrders(account, currentPrice, high, low, targetSymbol = null) {
     const events = [];
     const filledOrders = [];
-    if (!account.activePositions) {
-      account.activePositions = account.activePosition ? [account.activePosition] : [];
-    }
-    if (!account.pendingOrders || account.pendingOrders.length === 0) {
-      account.activePosition = account.activePositions[0] ?? null;
+    if (!ensureAccountState(account) || account.pendingOrders.length === 0) {
       return { account, filledOrders, events };
     }
 
-    const config = account.config || DEFAULT_BROKER_CONFIG;
-    const maxSimultaneous = config.maxSimultaneousPositions !== undefined ? config.maxSimultaneousPositions : 1;
+    const marketPrice = positivePrice(currentPrice);
+    const candleHigh = positivePrice(high ?? currentPrice);
+    const candleLow = positivePrice(low ?? currentPrice);
+    if (marketPrice === null || candleHigh === null || candleLow === null || candleHigh < candleLow) {
+      return { account, filledOrders, events };
+    }
 
-    const candleHigh = high ?? currentPrice;
-    const candleLow = low ?? currentPrice;
+    const pendingSymbols = [...new Set(account.pendingOrders.map(order => normalizeSymbol(order.symbol)).filter(Boolean))];
+    const cleanTarget = targetSymbol == null
+      ? (pendingSymbols.length === 1 ? pendingSymbols[0] : null)
+      : normalizeSymbol(targetSymbol);
+    if (!cleanTarget) {
+      events.push({
+        id: createId('EVT'),
+        time: new Date().toLocaleTimeString('en-US', { hour12: true }),
+        title: 'Pending orders not evaluated',
+        detail: 'A target symbol is required when orders exist for multiple stocks.',
+        type: 'error',
+      });
+      return { account, filledOrders, events };
+    }
+
+    const config = getBrokerConfig(account);
     const remainingPending = [];
 
     for (const order of account.pendingOrders) {
-      let isTriggered = false;
-
-      if (order.type === 'LIMIT') {
-        if (order.direction === 'LONG' && candleLow <= order.requestedPrice) {
-          isTriggered = true;
-        } else if (order.direction === 'SHORT' && candleHigh >= order.requestedPrice) {
-          isTriggered = true;
-        }
-      } else if (order.type === 'STOP') {
-        if (order.direction === 'LONG' && candleHigh >= order.requestedPrice) {
-          isTriggered = true;
-        } else if (order.direction === 'SHORT' && candleLow <= order.requestedPrice) {
-          isTriggered = true;
-        }
-      }
-
-      const hasCapacity = account.activePositions.length < maxSimultaneous &&
-        !account.activePositions.some(p => (p.symbol || '').toUpperCase().replace('.NS', '') === (order.symbol || '').toUpperCase().replace('.NS', ''));
-
-      if (isTriggered && hasCapacity) {
-        const fillPrice = parseFloat(calculateFillPrice(order.requestedPrice, order.direction, account.config).toFixed(2));
-        const commission = account.config.commission || 0;
-        const cost = fillPrice * order.quantity;
-
-        order.status = ORDER_STATUS.FILLED;
-        order.fillPrice = fillPrice;
-        order.filledAt = new Date().toISOString();
-
-        account.availableCash -= (cost + commission);
-
-        const position = {
-          id: `POS_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-          symbol: order.symbol,
-          direction: order.direction,
-          quantity: order.quantity,
-          entryPrice: fillPrice,
-          currentPrice: fillPrice,
-          stopLoss: order.stopLoss ? parseFloat(order.stopLoss.toFixed(2)) : null,
-          target1: order.target1 ? parseFloat(order.target1.toFixed(2)) : null,
-          target2: order.target2 ? parseFloat(order.target2.toFixed(2)) : null,
-          unrealizedPnL: 0,
-          pnlPct: 0,
-          status: POSITION_STATUS.OPEN,
-          entryTime: new Date().toISOString(),
-          orderId: order.id,
-          sessionId: order.sessionId || null,
-          setup: order.setup,
-        };
-
-        account.activePositions.push(position);
-        account.activePosition = account.activePositions[0] ?? null;
-        account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
-        account.unrealizedPnL = account.activePositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
-        account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
-
-        filledOrders.push(order);
-
-        const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
-        events.push({
-          id: Date.now(),
-          time: now(),
-          title: `Pending ${order.type} Order Filled`,
-          detail: `Filled ${order.quantity} ${order.symbol} @ ₹${fillPrice}.`,
-          type: 'success'
-        });
-      } else {
+      if (order.status !== ORDER_STATUS.PENDING || normalizeSymbol(order.symbol) !== cleanTarget) {
         remainingPending.push(order);
+        continue;
       }
+
+      const requestedPrice = positivePrice(order.requestedPrice);
+      const quantity = normalizeRequestedQuantity(order.quantity);
+      const isTriggered = requestedPrice !== null && (
+        (order.type === 'LIMIT' && order.direction === 'LONG' && candleLow <= requestedPrice)
+        || (order.type === 'LIMIT' && order.direction === 'SHORT' && candleHigh >= requestedPrice)
+        || (order.type === 'STOP' && order.direction === 'LONG' && candleHigh >= requestedPrice)
+        || (order.type === 'STOP' && order.direction === 'SHORT' && candleLow <= requestedPrice)
+      );
+
+      if (!isTriggered) {
+        remainingPending.push(order);
+        continue;
+      }
+
+      const hasCapacity = account.activePositions.length < config.maxSimultaneousPositions
+        && !account.activePositions.some(position => normalizeSymbol(position.symbol) === cleanTarget);
+      const orderConfig = {
+        ...config,
+        commission: Math.max(0, finiteNumber(order.commission, config.commission)),
+        slippage: Math.max(0, finiteNumber(order.slippage, config.slippage)),
+        spread: Math.max(0, finiteNumber(order.spread, config.spread)),
+      };
+      let executionBase = requestedPrice;
+      if (order.type === 'LIMIT' && requestedPrice !== null) {
+        executionBase = order.direction === 'LONG'
+          ? Math.min(requestedPrice, marketPrice)
+          : Math.max(requestedPrice, marketPrice);
+      } else if (order.type === 'STOP' && requestedPrice !== null) {
+        executionBase = order.direction === 'LONG'
+          ? Math.max(requestedPrice, marketPrice)
+          : Math.min(requestedPrice, marketPrice);
+      }
+      let simulatedFill = executionBase === null ? null : calculateFillPrice(executionBase, order.direction, orderConfig);
+      // A limit order may improve through a favorable gap, but can never fill
+      // beyond its limit after simulated spread/slippage is applied.
+      if (simulatedFill !== null && order.type === 'LIMIT') {
+        simulatedFill = order.direction === 'LONG'
+          ? Math.min(simulatedFill, requestedPrice)
+          : Math.max(simulatedFill, requestedPrice);
+      }
+      const fillPrice = simulatedFill === null ? null : parseFloat(simulatedFill.toFixed(2));
+      const totalCost = fillPrice === null ? Number.POSITIVE_INFINITY : (fillPrice * quantity) + orderConfig.commission;
+
+      if (fillPrice !== null && !hasValidTradeLevels(order.direction, fillPrice, order.stopLoss, order.target1, order.target2)) {
+        order.status = ORDER_STATUS.CANCELLED;
+        order.cancelledAt = new Date().toISOString();
+        syncOrderHistory(account, order);
+        events.push({
+          id: createId('EVT'),
+          time: new Date().toLocaleTimeString('en-US', { hour12: true }),
+          title: `Pending ${order.type} Order Cancelled`,
+          detail: 'The gap-adjusted fill would invalidate its protective stop or target levels.',
+          type: 'error',
+        });
+        continue;
+      }
+
+      if (!hasCapacity || quantity <= 0 || totalCost > account.availableCash) {
+        remainingPending.push(order);
+        events.push({
+          id: createId('EVT'),
+          time: new Date().toLocaleTimeString('en-US', { hour12: true }),
+          title: `Pending ${order.type} Order Deferred`,
+          detail: !hasCapacity ? 'Position capacity is unavailable.' : 'Available paper balance no longer covers this order.',
+          type: 'error',
+        });
+        continue;
+      }
+
+      order.status = ORDER_STATUS.FILLED;
+      order.fillPrice = fillPrice;
+      order.filledAt = new Date().toISOString();
+      syncOrderHistory(account, order);
+
+      account.availableCash -= totalCost;
+      account.realizedPnL -= orderConfig.commission;
+      account.dailyPnL -= orderConfig.commission;
+
+      account.activePositions.push({
+        id: createId('POS'),
+        symbol: cleanTarget,
+        direction: order.direction,
+        quantity,
+        originalQuantity: quantity,
+        remainingQuantity: quantity,
+        entryPrice: fillPrice,
+        currentPrice: fillPrice,
+        stopLoss: order.stopLoss,
+        initialStopLoss: order.stopLoss,
+        target1: order.target1,
+        target2: order.target2,
+        entryCommission: orderConfig.commission,
+        realizedPnL: -orderConfig.commission,
+        unrealizedPnL: 0,
+        pnlPct: 0,
+        status: POSITION_STATUS.OPEN,
+        entryTime: new Date().toISOString(),
+        orderId: order.id,
+        sessionId: order.sessionId || null,
+        setup: order.setup,
+        confidence: order.confidence,
+        riskReward: calculateRiskReward(order.direction, fillPrice, order.stopLoss, order.target1, order.riskReward),
+      });
+      filledOrders.push(order);
+      events.push({
+        id: createId('EVT'),
+        time: new Date().toLocaleTimeString('en-US', { hour12: true }),
+        title: `Pending ${order.type} Order Filled`,
+        detail: `Filled ${quantity} ${cleanTarget} @ ₹${fillPrice}.`,
+        type: 'success',
+      });
     }
 
     account.pendingOrders = remainingPending;
-    account.activePosition = account.activePositions[0] ?? null;
-    account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
-    account.unrealizedPnL = account.activePositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
-    account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
+    recalculateAccount(account);
     PaperTradingAccount.save(account);
-
     return { account, filledOrders, events };
   },
 
@@ -592,14 +728,26 @@ export const PaperBroker = {
    * Checks active position against Stop-Loss and Target levels.
    */
   checkPositionExitTriggers(account, currentPrice, high, low, targetSymbol = null) {
-    if (!account.activePositions) {
-      account.activePositions = account.activePosition ? [account.activePosition] : [];
+    if (!ensureAccountState(account)) return { account, closed: false, events: [] };
+
+    if (!targetSymbol && account.activePositions.length > 1) {
+      return {
+        account,
+        closed: false,
+        events: [{
+          id: createId('EVT'),
+          time: new Date().toLocaleTimeString('en-US', { hour12: true }),
+          title: 'Exit triggers not evaluated',
+          detail: 'A target symbol is required when multiple positions are open.',
+          type: 'error',
+        }],
+      };
     }
 
     let pos = null;
     if (targetSymbol) {
-      const cleanTarget = targetSymbol.toUpperCase().replace('.NS', '');
-      pos = account.activePositions.find(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanTarget || p.symbol === targetSymbol);
+      const cleanTarget = normalizeSymbol(targetSymbol);
+      pos = account.activePositions.find(position => normalizeSymbol(position.symbol) === cleanTarget);
       if (!pos) {
         return { account, closed: false, events: [] };
       }
@@ -611,26 +759,32 @@ export const PaperBroker = {
       return { account, closed: false, events: [] };
     }
 
-    const candleHigh = high ?? currentPrice;
-    const candleLow = low ?? currentPrice;
+    const marketPrice = positivePrice(currentPrice);
+    const candleHigh = positivePrice(high ?? currentPrice);
+    const candleLow = positivePrice(low ?? currentPrice);
+    if (marketPrice === null || candleHigh === null || candleLow === null || candleHigh < candleLow) {
+      return { account, closed: false, events: [] };
+    }
+    const stopLoss = positivePrice(pos.stopLoss);
+    const target1 = positivePrice(pos.target1);
 
     if (pos.direction === 'LONG') {
-      if (pos.stopLoss && candleLow <= pos.stopLoss) {
-        const result = this.closePosition(account, pos.stopLoss, 'Stop Loss Hit', null, pos.symbol);
-        return { account: result.account, closed: true, events: result.events };
+      if (stopLoss !== null && candleLow <= stopLoss) {
+        const result = this.closePosition(account, Math.min(stopLoss, marketPrice), 'Stop Loss Hit', null, pos.symbol);
+        return { account: result.account, closed: result.closedFully === true, events: result.events };
       }
-      if (pos.target1 && candleHigh >= pos.target1) {
-        const result = this.closePosition(account, pos.target1, 'Target 1 Reached', null, pos.symbol);
-        return { account: result.account, closed: true, events: result.events };
+      if (target1 !== null && candleHigh >= target1) {
+        const result = this.closePosition(account, target1, 'Target 1 Reached', null, pos.symbol);
+        return { account: result.account, closed: result.closedFully === true, events: result.events };
       }
     } else if (pos.direction === 'SHORT') {
-      if (pos.stopLoss && candleHigh >= pos.stopLoss) {
-        const result = this.closePosition(account, pos.stopLoss, 'Stop Loss Hit', null, pos.symbol);
-        return { account: result.account, closed: true, events: result.events };
+      if (stopLoss !== null && candleHigh >= stopLoss) {
+        const result = this.closePosition(account, Math.max(stopLoss, marketPrice), 'Stop Loss Hit', null, pos.symbol);
+        return { account: result.account, closed: result.closedFully === true, events: result.events };
       }
-      if (pos.target1 && candleLow <= pos.target1) {
-        const result = this.closePosition(account, pos.target1, 'Target 1 Reached', null, pos.symbol);
-        return { account: result.account, closed: true, events: result.events };
+      if (target1 !== null && candleLow <= target1) {
+        const result = this.closePosition(account, target1, 'Target 1 Reached', null, pos.symbol);
+        return { account: result.account, closed: result.closedFully === true, events: result.events };
       }
     }
 
@@ -644,16 +798,18 @@ export const PaperBroker = {
     const events = [];
     const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
 
-    if (!account.activePositions) {
-      account.activePositions = account.activePosition ? [account.activePosition] : [];
+    if (!ensureAccountState(account)) return { account, events, closedFully: false };
+
+    if (!targetSymbol && account.activePositions.length > 1) {
+      return { account, events, closedFully: false, reason: 'A target symbol is required when multiple positions are open' };
     }
 
     let pos = null;
     let posIndex = -1;
 
     if (targetSymbol) {
-      const cleanTarget = targetSymbol.toUpperCase().replace('.NS', '');
-      posIndex = account.activePositions.findIndex(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanTarget || p.symbol === targetSymbol);
+      const cleanTarget = normalizeSymbol(targetSymbol);
+      posIndex = account.activePositions.findIndex(position => normalizeSymbol(position.symbol) === cleanTarget);
       if (posIndex >= 0) {
         pos = account.activePositions[posIndex];
       } else {
@@ -673,33 +829,64 @@ export const PaperBroker = {
       return { account, events, closedFully: false };
     }
 
-    const direction = pos.direction;
-    const config = account.config || DEFAULT_BROKER_CONFIG;
-    const fillPrice = parseFloat(calculateFillPrice(currentPrice, direction === 'LONG' ? 'SHORT' : 'LONG', config).toFixed(2));
-    const commission = config.commission || 0;
+    const direction = normalizeDirection(pos.direction);
+    const entryPrice = positivePrice(pos.entryPrice);
+    const openQuantity = normalizeRequestedQuantity(pos.quantity);
+    const previouslyExitedQuantity = Array.isArray(pos.partialExits)
+      ? pos.partialExits.reduce((sum, exit) => sum + normalizeRequestedQuantity(exit?.quantity), 0)
+      : 0;
+    const originalQuantity = Math.max(
+      openQuantity,
+      normalizeRequestedQuantity(pos.originalQuantity),
+      openQuantity + previouslyExitedQuantity,
+    );
+    const requestedExit = positivePrice(currentPrice);
+    const config = getBrokerConfig(account);
+    const simulatedFill = requestedExit === null || direction === null
+      ? null
+      : calculateFillPrice(requestedExit, direction === 'LONG' ? 'SHORT' : 'LONG', config);
+    if (direction === null || entryPrice === null || openQuantity <= 0 || simulatedFill === null) {
+      return { account, events, closedFully: false, reason: 'Invalid position or exit price' };
+    }
+    const fillPrice = parseFloat(simulatedFill.toFixed(2));
+    const commission = config.commission;
+    const hasExplicitPartial = partialQuantity !== null && partialQuantity !== undefined;
+    const requestedPartial = hasExplicitPartial ? finiteNumber(partialQuantity) : null;
+    if (hasExplicitPartial && (
+      requestedPartial === null
+      || !Number.isInteger(requestedPartial)
+      || requestedPartial <= 0
+      || requestedPartial > openQuantity
+    )) {
+      return { account, events, closedFully: false, reason: 'Partial exit quantity must be a positive whole number no greater than the open quantity' };
+    }
 
     // Partial Exit Check
-    if (partialQuantity && partialQuantity > 0 && partialQuantity < pos.quantity) {
-      const exitQty = Math.floor(partialQuantity);
+    if (requestedPartial !== null && requestedPartial < openQuantity) {
+      const exitQty = requestedPartial;
       let pnl = direction === 'LONG' 
-        ? (fillPrice - pos.entryPrice) * exitQty 
-        : (pos.entryPrice - fillPrice) * exitQty;
+        ? (fillPrice - entryPrice) * exitQty
+        : (entryPrice - fillPrice) * exitQty;
       pnl -= commission;
 
-      account.realizedPnL = (account.realizedPnL || 0) + pnl;
-      account.dailyPnL = (account.dailyPnL || 0) + pnl;
+      account.realizedPnL = finiteNumber(account.realizedPnL, 0) + pnl;
+      account.dailyPnL = finiteNumber(account.dailyPnL, 0) + pnl;
+      pos.realizedPnL = finiteNumber(pos.realizedPnL, 0) + pnl;
+      pos.originalQuantity = originalQuantity;
 
       // Return released capital + profit/loss to available cash
-      const releasedCapital = pos.entryPrice * exitQty;
+      const releasedCapital = entryPrice * exitQty;
       account.availableCash += (releasedCapital + pnl);
       pos.quantity -= exitQty;
+      pos.currentPrice = fillPrice;
+      pos.unrealizedPnL = direction === 'LONG'
+        ? (fillPrice - entryPrice) * pos.quantity
+        : (entryPrice - fillPrice) * pos.quantity;
+      pos.pnlPct = pos.quantity > 0 ? (pos.unrealizedPnL / (entryPrice * pos.quantity)) * 100 : 0;
       if (pos.remainingQuantity !== undefined) {
         pos.remainingQuantity = pos.quantity;
       }
-      account.activePosition = account.activePositions[0] ?? null;
-      account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
-      account.unrealizedPnL = account.activePositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
-      account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
+      recalculateAccount(account);
 
       if (!pos.partialExits) pos.partialExits = [];
       pos.partialExits.push({
@@ -725,29 +912,41 @@ export const PaperBroker = {
     }
 
     // Full Exit
-    let pnl;
+    let exitPnL;
     if (direction === 'LONG') {
-      pnl = (fillPrice - pos.entryPrice) * pos.quantity;
+      exitPnL = (fillPrice - entryPrice) * openQuantity;
     } else {
-      pnl = (pos.entryPrice - fillPrice) * pos.quantity;
+      exitPnL = (entryPrice - fillPrice) * openQuantity;
     }
-    pnl -= commission;
+    exitPnL -= commission;
 
-    account.realizedPnL = (account.realizedPnL || 0) + pnl;
-    account.dailyPnL = (account.dailyPnL || 0) + pnl;
+    account.realizedPnL = finiteNumber(account.realizedPnL, 0) + exitPnL;
+    account.dailyPnL = finiteNumber(account.dailyPnL, 0) + exitPnL;
 
     // Return released capital + profit/loss to available cash
-    const releasedCapital = pos.entryPrice * pos.quantity;
-    account.availableCash += (releasedCapital + pnl);
+    const releasedCapital = entryPrice * openQuantity;
+    account.availableCash += (releasedCapital + exitPnL);
 
     pos.status = POSITION_STATUS.CLOSED;
+    pos.currentPrice = fillPrice;
     pos.exitPrice = fillPrice;
-    pos.realizedPnL = parseFloat(pnl.toFixed(2));
+    pos.realizedPnL = parseFloat((finiteNumber(pos.realizedPnL, 0) + exitPnL).toFixed(2));
+    pos.unrealizedPnL = 0;
+    pos.originalQuantity = originalQuantity;
+    pos.pnlPct = entryPrice * originalQuantity > 0
+      ? parseFloat(((pos.realizedPnL / (entryPrice * originalQuantity)) * 100).toFixed(4))
+      : 0;
+    pos.remainingQuantity = 0;
     pos.exitTime = new Date().toISOString();
     pos.exitReason = reason;
 
     if (!account.closedPositions) account.closedPositions = [];
-    account.closedPositions.push({ ...pos });
+    account.closedPositions.push({
+      ...pos,
+      quantity: originalQuantity,
+      originalQuantity,
+      finalExitQuantity: openQuantity,
+    });
 
     if (posIndex >= 0) {
       account.activePositions.splice(posIndex, 1);
@@ -755,23 +954,20 @@ export const PaperBroker = {
       account.activePositions = account.activePositions.filter(p => p.id !== pos.id && p.symbol !== pos.symbol);
     }
 
-    account.activePosition = account.activePositions[0] ?? null;
-    account.usedCapital = account.activePositions.reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
-    account.unrealizedPnL = account.activePositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
-    account.accountValue = account.availableCash + account.usedCapital + account.unrealizedPnL;
+    recalculateAccount(account);
 
-    const pnlStr = pnl >= 0 ? `+₹${pnl.toFixed(2)}` : `-₹${Math.abs(pnl).toFixed(2)}`;
+    const pnlStr = pos.realizedPnL >= 0 ? `+₹${pos.realizedPnL.toFixed(2)}` : `-₹${Math.abs(pos.realizedPnL).toFixed(2)}`;
     const dirLabel = direction === 'LONG' ? 'Sold' : 'Covered';
     events.push({ 
       id: Date.now(), 
       time: now(), 
-      title: `${dirLabel} ${pos.quantity} ${pos.symbol} @ ₹${fillPrice}`, 
+      title: `${dirLabel} ${openQuantity} ${pos.symbol} @ ₹${fillPrice}`,
       detail: `${reason}. Realized P&L: ${pnlStr}. Commission: ₹${commission}.`, 
-      type: pnl >= 0 ? 'success' : 'error' 
+      type: pos.realizedPnL >= 0 ? 'success' : 'error'
     });
 
     PaperTradingAccount.save(account);
-    return { account, events, closedFully: true, fillPrice, pnl };
+    return { account, events, closedFully: true, fillPrice, pnl: pos.realizedPnL };
   },
 
   /**
@@ -782,14 +978,16 @@ export const PaperBroker = {
     const events = [];
     const now = () => new Date().toLocaleTimeString('en-US', { hour12: true });
 
-    if (!account.activePositions) {
-      account.activePositions = account.activePosition ? [account.activePosition] : [];
+    if (!ensureAccountState(account)) return { account, updated: false, events };
+
+    if (!targetSymbol && account.activePositions.length > 1) {
+      return { account, updated: false, reason: 'A target symbol is required when multiple positions are open', events };
     }
 
     let pos = null;
     if (targetSymbol) {
-      const cleanTarget = targetSymbol.toUpperCase().replace('.NS', '');
-      pos = account.activePositions.find(p => (p.symbol || '').toUpperCase().replace('.NS', '') === cleanTarget || p.symbol === targetSymbol);
+      const cleanTarget = normalizeSymbol(targetSymbol);
+      pos = account.activePositions.find(position => normalizeSymbol(position.symbol) === cleanTarget);
       if (!pos) {
         return { account, updated: false, events };
       }
@@ -797,22 +995,33 @@ export const PaperBroker = {
       pos = account.activePositions[0] || account.activePosition;
     }
 
-    if (!pos || !newStopLoss || newStopLoss <= 0) {
+    const parsedStop = positivePrice(newStopLoss);
+    const direction = normalizeDirection(pos?.direction);
+    const currentPrice = positivePrice(pos?.currentPrice ?? pos?.entryPrice);
+    if (!pos || parsedStop === null || direction === null || currentPrice === null) {
       return { account, updated: false, events };
     }
 
-    const roundedSL = parseFloat(newStopLoss.toFixed(2));
+    const roundedSL = parseFloat(parsedStop.toFixed(2));
+    if ((direction === 'LONG' && roundedSL >= currentPrice) || (direction === 'SHORT' && roundedSL <= currentPrice)) {
+      return { account, updated: false, reason: 'Stop Loss must remain on the protective side of the current market price', events };
+    }
 
     // Rule 8: Never widen stops
-    if (pos.direction === 'LONG' && roundedSL < (pos.stopLoss || 0)) {
+    const existingStop = positivePrice(pos.stopLoss);
+    if (direction === 'LONG' && existingStop !== null && roundedSL < existingStop) {
       return { account, updated: false, reason: 'Cannot widen Stop Loss on Long position', events };
     }
-    if (pos.direction === 'SHORT' && pos.stopLoss && roundedSL > pos.stopLoss) {
+    if (direction === 'SHORT' && existingStop !== null && roundedSL > existingStop) {
       return { account, updated: false, reason: 'Cannot widen Stop Loss on Short position', events };
     }
 
     const oldSL = pos.stopLoss;
     pos.stopLoss = roundedSL;
+    const entryPrice = positivePrice(pos.entryPrice);
+    if (entryPrice !== null && ((direction === 'LONG' && roundedSL >= entryPrice) || (direction === 'SHORT' && roundedSL <= entryPrice))) {
+      pos.breakevenMoved = true;
+    }
 
     events.push({
       id: Date.now(),

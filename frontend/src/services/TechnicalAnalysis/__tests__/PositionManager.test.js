@@ -5,7 +5,7 @@ import { PaperTradingAccount } from '../PaperTradingAccount';
 
 // Mock sessionStorage for Node/Vitest test environment
 const mockStorage = {};
-global.sessionStorage = {
+globalThis.sessionStorage = {
   getItem: (key) => mockStorage[key] || null,
   setItem: (key, val) => { mockStorage[key] = val; },
   removeItem: (key) => { delete mockStorage[key]; },
@@ -137,6 +137,20 @@ describe('PositionManager', () => {
   });
 
   describe('Early Exits & Invalidation', () => {
+    it('forces an overnight intraday position out on the next trading day', () => {
+      mockPosition.entryTime = '2026-10-13T05:00:00.000Z';
+
+      const evaluation = PositionManager.evaluatePosition({
+        position: mockPosition,
+        currentPrice: 1005,
+        currentTime: '2026-10-14T05:00:00.000Z',
+        riskSettings: { intradayCutoffTime: '15:15' },
+      });
+
+      expect(evaluation.action).toBe(POSITION_DECISION.EXIT);
+      expect(evaluation.reason).toContain('Square-off enforced');
+    });
+
     it('exits early if high-confidence opposite signal appears', () => {
       const evaluation = PositionManager.evaluatePosition({
         position: mockPosition,

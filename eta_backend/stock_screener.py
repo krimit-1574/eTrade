@@ -5,6 +5,7 @@ Top 5 Intraday Picks and Top 5 Long-Term Investment Picks.
 """
 
 import json
+import math
 import re
 import time
 import threading
@@ -48,6 +49,7 @@ _cache = {
 }
 
 CACHE_TTL_SECONDS = 15 * 60  # 15 minutes
+EXPECTED_NSE_15M_BARS = 25
 
 
 def _is_cache_valid():
@@ -79,32 +81,48 @@ def _scan_intraday_candidates():
                 continue
 
             latest = df.iloc[-1]
-            close = latest["Close"]
-            volume = latest.get("Volume", 0)
-            high = latest["High"]
-            low = latest["Low"]
+            close = float(latest["Close"])
+            today_date = df.index[-1].date()
+            today_data = df[df.index.date == today_date]
+            if today_data.empty:
+                continue
+            session_high = float(today_data["High"].max())
+            session_low = float(today_data["Low"].min())
+            today_vol = float(today_data["Volume"].sum())
+            if (
+                not all(math.isfinite(value) for value in (close, session_high, session_low, today_vol))
+                or close <= 0 or session_high <= 0 or session_low <= 0 or today_vol < 0
+            ):
+                continue
 
             # Calculate intraday indicators
             # 1. RSI (14-period on 15-min candles)
             delta = df["Close"].diff()
             gain = delta.where(delta > 0, 0).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            rs = gain / (loss + 1e-9)
-            rsi = (100 - (100 / (1 + rs))).iloc[-1]
+            rs = gain / loss.replace(0, np.nan)
+            rsi_series = 100 - (100 / (1 + rs))
+            rsi_series = rsi_series.mask((gain == 0) & (loss == 0), 50)
+            rsi_series = rsi_series.mask((gain > 0) & (loss == 0), 100)
+            rsi_series = rsi_series.mask((gain == 0) & (loss > 0), 0)
+            rsi = float(rsi_series.iloc[-1])
+            if not math.isfinite(rsi):
+                rsi = 50.0
 
-            # 2. VWAP approximation
-            typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
-            cumulative_tp_vol = (typical_price * df["Volume"]).cumsum()
-            cumulative_vol = df["Volume"].cumsum()
-            vwap = (cumulative_tp_vol / (cumulative_vol + 1e-9)).iloc[-1]
+            # 2. Current-session VWAP. Mixing prior sessions produces an
+            # anchored multi-day average, not an intraday VWAP.
+            typical_price = (today_data["High"] + today_data["Low"] + today_data["Close"]) / 3
+            session_tp_vol = float((typical_price * today_data["Volume"]).sum())
+            vwap = session_tp_vol / today_vol if today_vol > 0 else close
 
-            # 3. Volume ratio (current vs 20-day average daily volume)
-            avg_daily_vol = df_daily["Volume"].rolling(20).mean().iloc[-1] if len(df_daily) >= 20 else df_daily["Volume"].mean()
-            # Sum today's intraday volume
-            today_date = df.index[-1].date()
-            today_data = df[df.index.date == today_date]
-            today_vol = today_data["Volume"].sum() if not today_data.empty else volume
-            vol_ratio = today_vol / (avg_daily_vol + 1) if avg_daily_vol > 0 else 1.0
+            # 3. Relative volume versus the expected volume *so far*. Comparing
+            # a partial session directly with a full-day mean understates RVOL.
+            prior_daily = df_daily[df_daily.index.date < today_date]
+            volume_history = prior_daily["Volume"].tail(20)
+            avg_daily_vol = float(volume_history.mean()) if not volume_history.empty else 0.0
+            session_progress = min(1.0, len(today_data) / EXPECTED_NSE_15M_BARS)
+            expected_volume_so_far = avg_daily_vol * session_progress
+            vol_ratio = today_vol / expected_volume_so_far if expected_volume_so_far > 0 else 1.0
 
             # 4. Price change from open today
             today_open = today_data.iloc[0]["Open"] if not today_data.empty else close
@@ -112,7 +130,7 @@ def _scan_intraday_candidates():
             price_change_pct = (price_change / today_open) * 100 if today_open > 0 else 0
 
             # 5. Previous close for daily change
-            prev_close = df_daily.iloc[-2]["Close"] if len(df_daily) > 1 else close
+            prev_close = float(prior_daily.iloc[-1]["Close"]) if not prior_daily.empty else close
             daily_change = close - prev_close
             daily_change_pct = (daily_change / prev_close) * 100 if prev_close > 0 else 0
 
@@ -143,7 +161,7 @@ def _scan_intraday_candidates():
                 score += 10
 
             # Range expansion (volatility for day trading)
-            day_range = ((high - low) / low) * 100 if low > 0 else 0
+            day_range = ((session_high - session_low) / session_low) * 100 if session_low > 0 else 0
             if day_range > 1.5:
                 score += 10
 
@@ -292,6 +310,162 @@ def _scan_longterm_candidates():
 
 # ── Gemini AI Ranking ────────────────────────────────────────────
 
+def _finite_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _safe_ai_text(value, limit=600):
+    return str(value or "").strip()[:limit]
+
+
+def _intraday_fallback(candidate):
+    price = float(candidate["currentPrice"])
+    return {
+        "symbol": candidate["symbol"],
+        "name": candidate["name"],
+        "currentPrice": price,
+        "change": candidate["change"],
+        "changePct": candidate["changePct"],
+        "target": round(price * 1.015, 2),
+        "stopLoss": round(price * 0.99, 2),
+        "reason": f"Strong momentum with RSI at {candidate['rsi']}, volume {candidate['volumeRatio']}x above average.",
+        "confidence": min(85, max(0, _finite_number(candidate.get("score")) or 0)),
+        "riskLevel": "Medium",
+        "strategy": "Enter on dip near VWAP support.",
+        "technicals": {
+            "rsi": candidate["rsi"],
+            "vwap": candidate["vwap"],
+            "volumeRatio": candidate["volumeRatio"],
+        },
+        "timeframe": "Intraday",
+    }
+
+
+def _longterm_fallback(candidate):
+    price = float(candidate["currentPrice"])
+    return {
+        "symbol": candidate["symbol"],
+        "name": candidate["name"],
+        "currentPrice": price,
+        "change": candidate["change"],
+        "changePct": candidate["changePct"],
+        "target1Y": round(price * 1.20, 2),
+        "reason": f"Strong fundamentals with P/E {candidate['pe']}, ROE {candidate['roe']}%.",
+        "confidence": min(80, max(0, _finite_number(candidate.get("score")) or 0)),
+        "riskLevel": "Medium",
+        "investmentHorizon": "1-3 Years",
+        "catalysts": "Sector growth and operational efficiency improvements.",
+        "fundamentals": {
+            "pe": candidate["pe"],
+            "roe": candidate["roe"],
+            "debtToEquity": candidate["debtToEquity"],
+            "revGrowth": candidate["revGrowth"],
+            "profitMargin": candidate["profitMargin"],
+            "dividendYield": candidate["dividendYield"],
+        },
+        "sector": candidate["sector"],
+    }
+
+
+def _validated_intraday_picks(ai_picks, candidates):
+    if not isinstance(ai_picks, list):
+        raise ValueError("Gemini intraday response must be a JSON array.")
+    candidate_map = {str(c["symbol"]).upper(): c for c in candidates}
+    result = []
+    seen = set()
+    for pick in ai_picks:
+        if not isinstance(pick, dict):
+            continue
+        symbol = str(pick.get("symbol") or "").strip().upper()
+        market = candidate_map.get(symbol)
+        if not market or symbol in seen:
+            continue
+        price = _finite_number(market.get("currentPrice"))
+        target = _finite_number(pick.get("target"))
+        stop = _finite_number(pick.get("stopLoss"))
+        confidence = _finite_number(pick.get("confidence"))
+        if (
+            price is None or price <= 0
+            or target is None or not (price < target <= price * 1.05)
+            or stop is None or not (price * 0.95 <= stop < price)
+            or confidence is None or not (0 <= confidence <= 100)
+        ):
+            continue
+        risk_level = str(pick.get("riskLevel") or "Medium").title()
+        if risk_level not in {"Low", "Medium", "High"}:
+            risk_level = "Medium"
+        result.append({
+            **_intraday_fallback(market),
+            "target": round(target, 2),
+            "stopLoss": round(stop, 2),
+            "reason": _safe_ai_text(pick.get("reason")),
+            "confidence": round(confidence, 1),
+            "riskLevel": risk_level,
+            "strategy": _safe_ai_text(pick.get("strategy"), 300),
+        })
+        seen.add(symbol)
+        if len(result) == 5:
+            break
+    for candidate in candidates:
+        symbol = str(candidate["symbol"]).upper()
+        if len(result) == 5:
+            break
+        if symbol not in seen:
+            result.append(_intraday_fallback(candidate))
+            seen.add(symbol)
+    return result
+
+
+def _validated_longterm_picks(ai_picks, candidates):
+    if not isinstance(ai_picks, list):
+        raise ValueError("Gemini long-term response must be a JSON array.")
+    candidate_map = {str(c["symbol"]).upper(): c for c in candidates}
+    result = []
+    seen = set()
+    for pick in ai_picks:
+        if not isinstance(pick, dict):
+            continue
+        symbol = str(pick.get("symbol") or "").strip().upper()
+        market = candidate_map.get(symbol)
+        if not market or symbol in seen:
+            continue
+        price = _finite_number(market.get("currentPrice"))
+        target = _finite_number(pick.get("target1Y"))
+        confidence = _finite_number(pick.get("confidence"))
+        if (
+            price is None or price <= 0
+            or target is None or not (price < target <= price * 3)
+            or confidence is None or not (0 <= confidence <= 100)
+        ):
+            continue
+        risk_level = str(pick.get("riskLevel") or "Medium").title()
+        if risk_level not in {"Low", "Medium", "High"}:
+            risk_level = "Medium"
+        result.append({
+            **_longterm_fallback(market),
+            "target1Y": round(target, 2),
+            "reason": _safe_ai_text(pick.get("reason")),
+            "confidence": round(confidence, 1),
+            "riskLevel": risk_level,
+            "investmentHorizon": _safe_ai_text(pick.get("investmentHorizon"), 80) or "1-3 Years",
+            "catalysts": _safe_ai_text(pick.get("catalysts"), 300),
+        })
+        seen.add(symbol)
+        if len(result) == 5:
+            break
+    for candidate in candidates:
+        symbol = str(candidate["symbol"]).upper()
+        if len(result) == 5:
+            break
+        if symbol not in seen:
+            result.append(_longterm_fallback(candidate))
+            seen.add(symbol)
+    return result
+
 def _ai_rank_intraday(candidates, api_key):
     """Use Gemini AI to rank and select top 5 intraday picks from pre-screened candidates."""
     if not candidates:
@@ -353,58 +527,12 @@ Provide exactly 5 picks ordered by confidence (highest first). Target should be 
         text = re.sub(r"\s*```$", "", text)
         ai_picks = json.loads(text)
 
-        # Merge AI analysis back with real market data
-        result = []
-        candidate_map = {c["symbol"]: c for c in candidates}
-        for pick in ai_picks[:5]:
-            sym = pick["symbol"]
-            market = candidate_map.get(sym, {})
-            result.append({
-                "symbol": sym,
-                "name": pick.get("name", market.get("name", sym)),
-                "currentPrice": market.get("currentPrice", 0),
-                "change": market.get("change", 0),
-                "changePct": market.get("changePct", 0),
-                "target": pick.get("target", 0),
-                "stopLoss": pick.get("stopLoss", 0),
-                "reason": pick.get("reason", ""),
-                "confidence": pick.get("confidence", 70),
-                "riskLevel": pick.get("riskLevel", "Medium"),
-                "strategy": pick.get("strategy", ""),
-                "technicals": {
-                    "rsi": market.get("rsi", 0),
-                    "vwap": market.get("vwap", 0),
-                    "volumeRatio": market.get("volumeRatio", 0),
-                },
-                "timeframe": "Intraday",
-            })
-        return result
+        return _validated_intraday_picks(ai_picks, candidates)
 
     except Exception as e:
         print(f"[Screener] Intraday AI ranking error: {e}")
         # Fallback: return top 5 by score without AI analysis
-        return [
-            {
-                "symbol": c["symbol"],
-                "name": c["name"],
-                "currentPrice": c["currentPrice"],
-                "change": c["change"],
-                "changePct": c["changePct"],
-                "target": round(c["currentPrice"] * 1.015, 2),
-                "stopLoss": round(c["currentPrice"] * 0.99, 2),
-                "reason": f"Strong momentum with RSI at {c['rsi']}, volume {c['volumeRatio']}x above average.",
-                "confidence": min(85, c["score"]),
-                "riskLevel": "Medium",
-                "strategy": "Enter on dip near VWAP support.",
-                "technicals": {
-                    "rsi": c["rsi"],
-                    "vwap": c["vwap"],
-                    "volumeRatio": c["volumeRatio"],
-                },
-                "timeframe": "Intraday",
-            }
-            for c in candidates[:5]
-        ]
+        return [_intraday_fallback(candidate) for candidate in candidates[:5]]
 
 
 def _ai_rank_longterm(candidates, api_key):
@@ -470,62 +598,11 @@ Provide exactly 5 picks ordered by confidence (highest first). target1Y should b
         text = re.sub(r"\s*```$", "", text)
         ai_picks = json.loads(text)
 
-        result = []
-        candidate_map = {c["symbol"]: c for c in candidates}
-        for pick in ai_picks[:5]:
-            sym = pick["symbol"]
-            market = candidate_map.get(sym, {})
-            result.append({
-                "symbol": sym,
-                "name": pick.get("name", market.get("name", sym)),
-                "currentPrice": market.get("currentPrice", 0),
-                "change": market.get("change", 0),
-                "changePct": market.get("changePct", 0),
-                "target1Y": pick.get("target1Y", 0),
-                "reason": pick.get("reason", ""),
-                "confidence": pick.get("confidence", 70),
-                "riskLevel": pick.get("riskLevel", "Medium"),
-                "investmentHorizon": pick.get("investmentHorizon", "1-3 Years"),
-                "catalysts": pick.get("catalysts", ""),
-                "fundamentals": {
-                    "pe": market.get("pe", "N/A"),
-                    "roe": market.get("roe", "N/A"),
-                    "debtToEquity": market.get("debtToEquity", "N/A"),
-                    "revGrowth": market.get("revGrowth", "N/A"),
-                    "profitMargin": market.get("profitMargin", "N/A"),
-                    "dividendYield": market.get("dividendYield", "N/A"),
-                },
-                "sector": market.get("sector", "Unknown"),
-            })
-        return result
+        return _validated_longterm_picks(ai_picks, candidates)
 
     except Exception as e:
         print(f"[Screener] Long-term AI ranking error: {e}")
-        return [
-            {
-                "symbol": c["symbol"],
-                "name": c["name"],
-                "currentPrice": c["currentPrice"],
-                "change": c["change"],
-                "changePct": c["changePct"],
-                "target1Y": round(c["currentPrice"] * 1.20, 2),
-                "reason": f"Strong fundamentals with P/E {c['pe']}, ROE {c['roe']}%.",
-                "confidence": min(80, c["score"]),
-                "riskLevel": "Medium",
-                "investmentHorizon": "1-3 Years",
-                "catalysts": "Sector growth and operational efficiency improvements.",
-                "fundamentals": {
-                    "pe": c["pe"],
-                    "roe": c["roe"],
-                    "debtToEquity": c["debtToEquity"],
-                    "revGrowth": c["revGrowth"],
-                    "profitMargin": c["profitMargin"],
-                    "dividendYield": c["dividendYield"],
-                },
-                "sector": c["sector"],
-            }
-            for c in candidates[:5]
-        ]
+        return [_longterm_fallback(candidate) for candidate in candidates[:5]]
 
 
 # ── Main Entry Point ─────────────────────────────────────────────

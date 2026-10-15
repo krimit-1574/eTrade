@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { RiskEngine, DEFAULT_RISK_SETTINGS, REJECTION_CODES } from '../RiskEngine';
 
+const MARKET_OPEN_TIME = '2026-10-14T05:30:00.000Z'; // Wednesday, 11:00 IST
+
 describe('RiskEngine', () => {
   let defaultSettings;
   let mockAccount;
@@ -134,16 +136,11 @@ describe('RiskEngine', () => {
           tradingStartTime: '00:00', // Bypass clock in unit test
           intradayCutoffTime: '23:59',
         },
+        currentTime: MARKET_OPEN_TIME,
       });
 
-      // If weekend, it rejects with MARKET_CLOSED, otherwise APPROVED
-      const day = new Date().getDay();
-      if (day === 0 || day === 6) {
-        expect(validation.code).toBe(REJECTION_CODES.MARKET_CLOSED);
-      } else {
-        expect(validation.approved).toBe(true);
-        expect(validation.quantity).toBeGreaterThan(0);
-      }
+      expect(validation.approved).toBe(true);
+      expect(validation.quantity).toBeGreaterThan(0);
     });
 
     it('rejects trade if confidence is below minimum', () => {
@@ -157,13 +154,11 @@ describe('RiskEngine', () => {
           tradingStartTime: '00:00',
           intradayCutoffTime: '23:59',
         },
+        currentTime: MARKET_OPEN_TIME,
       });
 
-      const day = new Date().getDay();
-      if (day !== 0 && day !== 6) {
-        expect(validation.approved).toBe(false);
-        expect(validation.code).toBe(REJECTION_CODES.LOW_CONFIDENCE);
-      }
+      expect(validation.approved).toBe(false);
+      expect(validation.code).toBe(REJECTION_CODES.LOW_CONFIDENCE);
     });
 
     it('rejects trade if Risk/Reward is below minimum', () => {
@@ -177,13 +172,11 @@ describe('RiskEngine', () => {
           tradingStartTime: '00:00',
           intradayCutoffTime: '23:59',
         },
+        currentTime: MARKET_OPEN_TIME,
       });
 
-      const day = new Date().getDay();
-      if (day !== 0 && day !== 6) {
-        expect(validation.approved).toBe(false);
-        expect(validation.code).toBe(REJECTION_CODES.POOR_RISK_REWARD);
-      }
+      expect(validation.approved).toBe(false);
+      expect(validation.code).toBe(REJECTION_CODES.POOR_RISK_REWARD);
     });
 
     it('rejects trade if daily loss limit is breached', () => {
@@ -197,20 +190,19 @@ describe('RiskEngine', () => {
           tradingStartTime: '00:00',
           intradayCutoffTime: '23:59',
         },
+        currentTime: MARKET_OPEN_TIME,
       });
 
-      const day = new Date().getDay();
-      if (day !== 0 && day !== 6) {
-        expect(validation.approved).toBe(false);
-        expect(validation.code).toBe(REJECTION_CODES.DAILY_LOSS_LIMIT);
-      }
+      expect(validation.approved).toBe(false);
+      expect(validation.code).toBe(REJECTION_CODES.DAILY_LOSS_LIMIT);
     });
 
     it('rejects trade if maximum consecutive losses reached', () => {
+      const today = new Date(MARKET_OPEN_TIME).toISOString();
       mockAccount.closedPositions = [
-        { realizedPnL: -500 },
-        { realizedPnL: -400 },
-        { realizedPnL: -300 }, // 3 consecutive losses
+        { realizedPnL: -500, exitTime: today },
+        { realizedPnL: -400, exitTime: today },
+        { realizedPnL: -300, exitTime: today }, // 3 consecutive losses
       ];
 
       const validation = RiskEngine.validateTrade({
@@ -223,17 +215,15 @@ describe('RiskEngine', () => {
           intradayCutoffTime: '23:59',
           maxConsecutiveLosses: 3,
         },
+        currentTime: MARKET_OPEN_TIME,
       });
 
-      const day = new Date().getDay();
-      if (day !== 0 && day !== 6) {
-        expect(validation.approved).toBe(false);
-        expect(validation.code).toBe(REJECTION_CODES.MAX_CONSECUTIVE_LOSSES);
-      }
+      expect(validation.approved).toBe(false);
+      expect(validation.code).toBe(REJECTION_CODES.MAX_CONSECUTIVE_LOSSES);
     });
 
     it('rejects trade if post-trade cooldown is still active for symbol', () => {
-      const exitJustNow = new Date(Date.now() - 60000).toISOString(); // 1 minute ago (< 5m cooldown)
+      const exitJustNow = new Date(new Date(MARKET_OPEN_TIME).getTime() - 60000).toISOString(); // 1 minute ago (< 5m cooldown)
       mockAccount.closedPositions = [
         { symbol: 'RELIANCE', exitTime: exitJustNow, exitReason: 'Target 1 Reached', setup: 'other' }
       ];
@@ -248,17 +238,15 @@ describe('RiskEngine', () => {
           intradayCutoffTime: '23:59',
           cooldownMinutes: 5,
         },
+        currentTime: MARKET_OPEN_TIME,
       });
 
-      const day = new Date().getDay();
-      if (day !== 0 && day !== 6) {
-        expect(validation.approved).toBe(false);
-        expect(validation.code).toBe(REJECTION_CODES.COOLDOWN_ACTIVE);
-      }
+      expect(validation.approved).toBe(false);
+      expect(validation.code).toBe(REJECTION_CODES.COOLDOWN_ACTIVE);
     });
 
     it('blocks immediate revenge trading after stop-out', () => {
-      const exitRecently = new Date(Date.now() - 120000).toISOString(); // 2 mins ago
+      const exitRecently = new Date(new Date(MARKET_OPEN_TIME).getTime() - 120000).toISOString(); // 2 mins ago
       mockAccount.closedPositions = [
         { symbol: 'RELIANCE', exitTime: exitRecently, exitReason: 'Stop Loss Hit', setup: 'breakout' }
       ];
@@ -273,13 +261,119 @@ describe('RiskEngine', () => {
           intradayCutoffTime: '23:59',
           cooldownMinutes: 1, // cooldown passed, but revenge trading rule triggers
         },
+        currentTime: MARKET_OPEN_TIME,
       });
 
-      const day = new Date().getDay();
-      if (day !== 0 && day !== 6) {
-        expect(validation.approved).toBe(false);
-        expect(validation.code).toBe(REJECTION_CODES.REVENGE_TRADING_BLOCKED);
-      }
+      expect(validation.approved).toBe(false);
+      expect(validation.code).toBe(REJECTION_CODES.REVENGE_TRADING_BLOCKED);
+    });
+
+    it('fails closed when market data is stale', () => {
+      const validation = RiskEngine.validateTrade({
+        account: mockAccount,
+        decision: validDecision,
+        stockInfo: { sym: 'RELIANCE', isStaleData: true },
+        customSettings: { ...defaultSettings, tradingStartTime: '00:00', intradayCutoffTime: '23:59' },
+        currentTime: MARKET_OPEN_TIME,
+      });
+
+      expect(validation.approved).toBe(false);
+      expect(validation.code).toBe(REJECTION_CODES.STALE_DATA);
+    });
+
+    it('uses actual stop and target levels instead of trusting an optimistic reported ratio', () => {
+      const validation = RiskEngine.validateTrade({
+        account: mockAccount,
+        decision: { ...validDecision, target1: 505, riskReward: 9 },
+        stockInfo: { sym: 'RELIANCE' },
+        customSettings: { ...defaultSettings, tradingStartTime: '00:00', intradayCutoffTime: '23:59' },
+        currentTime: MARKET_OPEN_TIME,
+      });
+
+      expect(validation.approved).toBe(false);
+      expect(validation.code).toBe(REJECTION_CODES.POOR_RISK_REWARD);
+    });
+
+    it('compares the unrounded risk/reward ratio at the configured boundary', () => {
+      const validation = RiskEngine.validateTrade({
+        account: mockAccount,
+        decision: { ...validDecision, target1: 514.95, riskReward: 1.5 },
+        stockInfo: { sym: 'RELIANCE' },
+        customSettings: { ...defaultSettings, tradingStartTime: '00:00', intradayCutoffTime: '23:59' },
+        currentTime: MARKET_OPEN_TIME,
+      });
+
+      expect(validation.approved).toBe(false);
+      expect(validation.code).toBe(REJECTION_CODES.POOR_RISK_REWARD);
+    });
+
+    it('does not carry a prior trading day loss into the new day', () => {
+      mockAccount.dailyPnL = -5000;
+      mockAccount.tradingDate = '2026-10-13';
+
+      const validation = RiskEngine.validateTrade({
+        account: mockAccount,
+        decision: validDecision,
+        stockInfo: { sym: 'RELIANCE' },
+        customSettings: { ...defaultSettings, tradingStartTime: '00:00', intradayCutoffTime: '23:59' },
+        currentTime: MARKET_OPEN_TIME,
+      });
+
+      expect(validation.approved).toBe(true);
+    });
+
+    it('does not manufacture buying power from account equity when cash is zero', () => {
+      mockAccount.availableCash = 0;
+      const validation = RiskEngine.validateTrade({
+        account: mockAccount,
+        decision: validDecision,
+        stockInfo: { sym: 'RELIANCE' },
+        customSettings: { ...defaultSettings, tradingStartTime: '00:00', intradayCutoffTime: '23:59' },
+        currentTime: MARKET_OPEN_TIME,
+      });
+
+      expect(validation.approved).toBe(false);
+      expect(validation.code).toBe(REJECTION_CODES.INSUFFICIENT_CAPITAL);
+    });
+
+    it('includes live position notional in the total exposure cap', () => {
+      mockAccount.activePositions = [{
+        symbol: 'INFY',
+        status: 'POSITION_OPEN',
+        entryPrice: 700,
+        currentPrice: 900,
+        quantity: 89,
+        entryTime: MARKET_OPEN_TIME,
+      }];
+      mockAccount.usedCapital = 62300;
+      mockAccount.availableCash = 37700;
+
+      const validation = RiskEngine.validateTrade({
+        account: mockAccount,
+        decision: validDecision,
+        stockInfo: { sym: 'RELIANCE' },
+        customSettings: { ...defaultSettings, tradingStartTime: '00:00', intradayCutoffTime: '23:59' },
+        currentTime: MARKET_OPEN_TIME,
+      });
+
+      expect(validation.approved).toBe(false);
+      expect(validation.code).toBe(REJECTION_CODES.MAX_TOTAL_EXPOSURE_REACHED);
+    });
+  });
+
+  describe('Market timing', () => {
+    it('uses IST consistently and rejects weekends and cutoff entries', () => {
+      const saturday = RiskEngine.checkMarketTimingForEntry({
+        settings: defaultSettings,
+        currentTime: '2026-10-17T05:30:00.000Z',
+      });
+      const cutoff = RiskEngine.checkMarketTimingForEntry({
+        settings: defaultSettings,
+        currentTime: '2026-10-14T09:45:00.000Z', // 15:15 IST
+      });
+
+      expect(saturday.code).toBe(REJECTION_CODES.MARKET_CLOSED);
+      expect(cutoff.code).toBe(REJECTION_CODES.CUTOFF_TIME_REACHED);
     });
   });
 });

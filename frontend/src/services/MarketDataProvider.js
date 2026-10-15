@@ -6,6 +6,7 @@
  */
 
 import { ERROR_TYPES, MARKET_STATUS } from './MarketDataTypes';
+import { api } from '../api';
 
 // Realistic Fallback Provider dataset (clearly labeled if backend is disconnected)
 const FALLBACK_UNIVERSE = [
@@ -28,22 +29,11 @@ export const MarketDataProvider = {
    */
   async fetchIntradayScan(forceRefresh = false) {
     try {
-      const url = forceRefresh ? '/api/screener/intraday/refresh' : '/api/screener/intraday';
-      const method = forceRefresh ? 'POST' : 'GET';
-
-      const response = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-      });
-
-      if (!response.ok) {
-        if (response.status === 429) {
-          throw new Error(ERROR_TYPES.RATE_LIMIT);
-        }
-        throw new Error(`API HTTP Error ${response.status}`);
-      }
-
-      const data = await response.json();
+      // The refresh route is authenticated. Reuse the shared client so its
+      // bearer token and centralized 401 handling are applied consistently.
+      const data = forceRefresh
+        ? await api.refreshIntradayScan()
+        : await api.getIntradayScan();
 
       return {
         success: true,
@@ -63,7 +53,7 @@ export const MarketDataProvider = {
       let errorType = ERROR_TYPES.NO_CONNECTION;
       let errorMsg = 'Backend API unreachable. Using Fallback Market Provider.';
 
-      if (err.message === ERROR_TYPES.RATE_LIMIT) {
+      if (err.status === 429 || err.message === ERROR_TYPES.RATE_LIMIT) {
         errorType = ERROR_TYPES.RATE_LIMIT;
         errorMsg = 'API rate limit reached. Displaying cached fallback data.';
       }

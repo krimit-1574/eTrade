@@ -25,7 +25,7 @@ function getSessionOwner(session) {
 
 // ─── Analytics Calculator ────────────────────────────────────────
 
-function calculateAnalytics(trades, startingCapital, endingCapital) {
+function calculateAnalytics(trades, startingCapital, _endingCapital) {
   if (!trades || trades.length === 0) {
     return {
       totalTrades: 0,
@@ -399,7 +399,7 @@ function buildSessionPayload(accountOrOptions, symbolArg, timelineEventsArg, dec
   const trades = sessionPositions.map(pos => ({
     symbol: pos.symbol || cleanSym,
     direction: pos.direction,
-    quantity: pos.quantity,
+    quantity: pos.originalQuantity ?? pos.quantity,
     entryPrice: pos.entryPrice,
     exitPrice: pos.exitPrice,
     entryTime: pos.entryTime,
@@ -561,6 +561,13 @@ export const SessionJournalService = {
     // Always mirror locally first
     saveSessionLocally(normalizedSession);
 
+    // Guest mode intentionally has no bearer token or server-side account.
+    // Keep its journal in the owner-scoped local mirror and avoid a guaranteed
+    // 401 from the authenticated session endpoint.
+    if (getSessionOwner(normalizedSession) === 'guest') {
+      return { saved: true, backendOk: false, localOnly: true };
+    }
+
     try {
       const result = await api.saveAISession(normalizedSession);
       return { saved: true, backendOk: true, result };
@@ -577,6 +584,8 @@ export const SessionJournalService = {
   async getSessions(userId) {
     const owner = normalizeUserId(userId);
     const localSessions = getLocalSessions().filter(session => getSessionOwner(session) === owner);
+
+    if (owner === 'guest') return localSessions;
 
     try {
       const backendSessions = await api.getAISessions(userId);
@@ -598,6 +607,12 @@ export const SessionJournalService = {
    * Fetches a single session detail (backend first, localStorage fallback).
    */
   async getSession(sessionId, userId) {
+    const owner = normalizeUserId(userId);
+    const localSessions = getLocalSessions();
+    if (owner === 'guest') {
+      return localSessions.find(s => s.id === sessionId && getSessionOwner(s) === owner) || null;
+    }
+
     try {
       const session = await api.getAISession(sessionId);
       if (session) return session;
@@ -605,8 +620,6 @@ export const SessionJournalService = {
       console.warn('SessionJournalService: Backend fetch failed, checking localStorage', err);
     }
 
-    const owner = normalizeUserId(userId);
-    const localSessions = getLocalSessions();
     return localSessions.find(s => s.id === sessionId && getSessionOwner(s) === owner) || null;
   },
 

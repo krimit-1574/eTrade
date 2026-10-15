@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { History, CheckCircle2, Clock, Terminal, Shield } from 'lucide-react';
 
-export default function AIIntradayTimelinePanel({ symbol, sessionTime, events = [] }) {
+export default function AIIntradayTimelinePanel({ events = [] }) {
   
   // Sort events so newest is on top (descending id/time)
   const sortedEvents = [...events].sort((a, b) => b.id - a.id);

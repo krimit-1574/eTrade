@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { motion } from 'framer-motion';
+import { motion as Motion } from 'framer-motion';
 import { BarChart3 } from 'lucide-react';
 import { api } from '../api';
 
@@ -66,7 +66,7 @@ export default function ComparePage({ user }) {
       {error && <div className="error-banner">{error}</div>}
 
       {result && (
-        <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}>
+        <Motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}>
           {/* Score Cards */}
           <div className="grid-2 mb-24">
             <div className="card metric-card card-accent-gold">
@@ -98,7 +98,7 @@ export default function ComparePage({ user }) {
                 <span style={{ flex: 1, textAlign: 'right', fontSize: '0.7rem', fontWeight: 700, color: 'var(--blue)', textTransform: 'uppercase', letterSpacing: '1px' }}>{result.stock2.symbol}</span>
               </div>
               {METRICS.map(({ label, key }, i) => (
-                <motion.div
+                <Motion.div
                   key={key}
                   className="flex-between"
                   style={{ padding: '10px 0', borderBottom: '1px solid var(--border)' }}
@@ -113,11 +113,11 @@ export default function ComparePage({ user }) {
                   <span style={{ flex: 1, textAlign: 'right', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
                     {result.stock2.financials?.[key] || 'N/A'}
                   </span>
-                </motion.div>
+                </Motion.div>
               ))}
             </div>
           </div>
-        </motion.div>
+        </Motion.div>
       )}
     </div>
   );

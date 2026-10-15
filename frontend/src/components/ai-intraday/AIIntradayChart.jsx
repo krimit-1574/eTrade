@@ -252,14 +252,16 @@ export default function AIIntradayChart({
         priceLinesRef.current.forEach((line) => {
           try {
             candleSeriesRef.current.removePriceLine(line);
-          } catch (_) {}
+          } catch {
+            // The chart may already have disposed this price line.
+          }
         });
         priceLinesRef.current = [];
       }
 
       // Render Trade Plan / Active Position Price Lines (Entry, SL, T1, T2)
       if (tradeLevels && candleSeriesRef.current) {
-        const { entry, stopLoss, target1, target2, direction } = tradeLevels;
+        const { entry, stopLoss, target1, target2 } = tradeLevels;
 
         if (entry && entry > 0) {
           const entryLine = candleSeriesRef.current.createPriceLine({

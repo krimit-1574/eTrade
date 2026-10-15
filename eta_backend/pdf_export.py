@@ -1,6 +1,11 @@
 from fpdf import FPDF
 import tempfile
 
+
+def _pdf_text(value):
+    """Core FPDF fonts are Latin-1; replace unsupported AI/user glyphs safely."""
+    return str(value or "").encode("latin-1", errors="replace").decode("latin-1")
+
 def create_pdf_report(data):
     pdf = FPDF()
     pdf.add_page()
@@ -10,8 +15,8 @@ def create_pdf_report(data):
     pdf.set_font("Arial", 'B', 24)
     pdf.set_text_color(184, 150, 46) # Gold
     
-    company = data.get('companyName', 'Stock')
-    symbol = data.get('symbol', 'SYM')
+    company = _pdf_text(data.get('companyName', 'Stock'))
+    symbol = _pdf_text(data.get('symbol', 'SYM'))
     
     # Title
     pdf.cell(0, 10, f"eTA Research: {company} ({symbol})", ln=True, align='L')
@@ -22,12 +27,12 @@ def create_pdf_report(data):
     sector = data.get('sector', '')
     exchange = data.get('exchange', '')
     mcap = data.get('financials', {}).get('mktCap', '')
-    pdf.cell(0, 10, f"{sector} . {exchange} . {mcap}", ln=True, align='L')
+    pdf.cell(0, 10, _pdf_text(f"{sector} . {exchange} . {mcap}"), ln=True, align='L')
     pdf.ln(5)
     
     pdf.set_font("Arial", 'I', 11)
     pdf.set_text_color(50, 50, 50)
-    pdf.multi_cell(0, 8, data.get('description', ''))
+    pdf.multi_cell(0, 8, _pdf_text(data.get('description', '')))
     pdf.ln(5)
     
     # AI Score
@@ -38,7 +43,7 @@ def create_pdf_report(data):
     pdf.cell(0, 10, f"AI Score: {score}/100", ln=True)
     pdf.set_font("Arial", '', 11)
     pdf.set_text_color(0, 0, 0)
-    pdf.multi_cell(0, 8, data.get('scoreReason', ''))
+    pdf.multi_cell(0, 8, _pdf_text(data.get('scoreReason', '')))
     pdf.ln(5)
     
     # Bull Case
@@ -48,9 +53,9 @@ def create_pdf_report(data):
     pdf.set_text_color(0, 0, 0)
     for b in data.get('bullCase', []):
         pdf.set_font("Arial", 'B', 12)
-        pdf.cell(0, 8, b.get('title', ''), ln=True)
+        pdf.cell(0, 8, _pdf_text(b.get('title', '')), ln=True)
         pdf.set_font("Arial", '', 11)
-        pdf.multi_cell(0, 8, b.get('detail', ''))
+        pdf.multi_cell(0, 8, _pdf_text(b.get('detail', '')))
     pdf.ln(5)
     
     # Bear Case
@@ -60,9 +65,9 @@ def create_pdf_report(data):
     pdf.set_text_color(0, 0, 0)
     for b in data.get('bearCase', []):
         pdf.set_font("Arial", 'B', 12)
-        pdf.cell(0, 8, b.get('title', ''), ln=True)
+        pdf.cell(0, 8, _pdf_text(b.get('title', '')), ln=True)
         pdf.set_font("Arial", '', 11)
-        pdf.multi_cell(0, 8, b.get('detail', ''))
+        pdf.multi_cell(0, 8, _pdf_text(b.get('detail', '')))
     pdf.ln(5)
     
     # Financials
@@ -72,8 +77,8 @@ def create_pdf_report(data):
     pdf.set_font("Arial", '', 11)
     fins = data.get('financials', {})
     for k, v in fins.items():
-        pdf.cell(60, 8, str(k).upper(), border=1)
-        pdf.cell(0, 8, str(v), border=1, ln=True)
+        pdf.cell(60, 8, _pdf_text(str(k).upper()), border=1)
+        pdf.cell(0, 8, _pdf_text(v), border=1, ln=True)
     pdf.ln(5)
     
     # Advice
@@ -83,12 +88,13 @@ def create_pdf_report(data):
     add = advice.get('add', False)
     pdf.set_text_color(22, 163, 74) if add else pdf.set_text_color(220, 38, 38)
     pdf.set_font("Arial", 'B', 12)
-    pdf.cell(0, 8, "✓ RECOMMENDED TO ADD" if add else "✗ AVOID / HOLD OFF", ln=True)
+    pdf.cell(0, 8, "[YES] RECOMMENDED TO ADD" if add else "[NO] AVOID / HOLD OFF", ln=True)
     pdf.set_font("Arial", '', 11)
     pdf.set_text_color(0, 0, 0)
-    pdf.multi_cell(0, 8, advice.get('reasoning', ''))
+    pdf.multi_cell(0, 8, _pdf_text(advice.get('reasoning', '')))
     
     # Write to temp file
-    temp = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-    pdf.output(temp.name)
-    return temp.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp:
+        path = temp.name
+    pdf.output(path)
+    return path

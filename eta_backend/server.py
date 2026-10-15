@@ -3,7 +3,7 @@ import logging
 import math
 import os
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -117,6 +117,34 @@ def _mask_secret(value):
     return f"...{value[-4:]}" if len(value) > 4 else "saved"
 
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _is_nse_market_open(now=None):
+    current = (now or datetime.now(timezone.utc)).astimezone(IST)
+    minutes = current.hour * 60 + current.minute
+    return current.weekday() < 5 and (9 * 60 + 15) <= minutes < (15 * 60 + 30)
+
+
+def _quote_is_fresh(quote, now=None):
+    if not isinstance(quote, dict) or quote.get("is_delayed") is not False:
+        return False
+    # A trading-day-only quote cannot prove that the execution price is recent.
+    if quote.get("as_of_precision") != "timestamp":
+        return False
+    try:
+        as_of = datetime.fromisoformat(str(quote.get("as_of", "")).replace("Z", "+00:00"))
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        age = (current.astimezone(timezone.utc) - as_of.astimezone(timezone.utc)).total_seconds()
+        return -30 <= age <= md.QUOTE_FRESHNESS_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
 class AuthRequest(BaseModel):
     username: str = Field(min_length=1, max_length=254)
     password: str = Field(min_length=1, max_length=1024)
@@ -159,7 +187,7 @@ class TradeOrderRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=64)
     name: str = Field(default="", max_length=200)
     order_type: str = Field(min_length=3, max_length=4)
-    quantity: float = Field(gt=0, allow_inf_nan=False)
+    quantity: int = Field(gt=0, strict=True)
     price: float = Field(gt=0, allow_inf_nan=False)
 
 
@@ -183,8 +211,9 @@ class AISessionPayload(BaseModel):
     realized_pnl: float = Field(default=0.0, allow_inf_nan=False)
     trade_count: int = Field(default=0, ge=0)
     analytics: dict = Field(default_factory=dict)
-    trades: list = Field(default_factory=list)
-    decisions: list = Field(default_factory=list)
+    trades: list = Field(default_factory=list, max_length=1000)
+    decisions: list = Field(default_factory=list, max_length=1000)
+    timeline: list = Field(default_factory=list, max_length=1000)
     created_at: str = Field(default="", max_length=64)
 
 
@@ -356,8 +385,14 @@ def get_history(
     if period not in allowed_periods or interval not in allowed_intervals:
         raise HTTPException(status_code=422, detail="Unsupported history period or interval.")
     df = md.fetch_historical_data(symbol, period, interval=interval or None)
+    history_meta = {
+        "requestedInterval": str(df.attrs.get("requested_interval") or interval or ""),
+        "effectiveInterval": str(df.attrs.get("effective_interval") or ""),
+        "isFallback": bool(df.attrs.get("is_fallback", False)),
+        "fallbackReason": str(df.attrs.get("fallback_reason") or ""),
+    }
     if df.empty:
-        return {"data": []}
+        return {"data": [], **history_meta}
     records = []
     is_intraday = period in {"1d", "5d"} or interval in {"1m", "2m", "3m", "5m", "15m", "30m", "60m"}
     for idx, row in df.iterrows():
@@ -370,11 +405,16 @@ def get_history(
             "high": round(values[1], 2),
             "low": round(values[2], 2),
             "close": round(values[3], 2),
-            "volume": int(row.get("Volume", 0)) if math.isfinite(float(row.get("Volume", 0))) else 0,
+            "volume": 0,
         }
+        try:
+            raw_volume = float(row.get("Volume", 0))
+            rec["volume"] = int(raw_volume) if math.isfinite(raw_volume) and raw_volume >= 0 else 0
+        except (TypeError, ValueError, OverflowError):
+            rec["volume"] = 0
         rec["time"] = int(idx.timestamp()) if is_intraday else idx.strftime("%Y-%m-%d")
         records.append(rec)
-    return {"data": records}
+    return {"data": records, **history_meta}
 
 
 @app.get("/api/search")
@@ -435,16 +475,32 @@ def export_pdf(data: dict, background_tasks: BackgroundTasks, _user_id=Depends(g
 @app.post("/api/trading/order")
 def execute_trading_order(req: TradeOrderRequest, user_id=Depends(get_current_user_id)):
     requested_symbol = _clean_symbol(req.symbol)
+    if "." not in requested_symbol:
+        requested_symbol = f"{requested_symbol}.NS"
+    elif not requested_symbol.endswith((".NS", ".BO")):
+        raise HTTPException(status_code=422, detail="Paper trading currently supports INR-denominated NSE/BSE symbols only.")
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9&-]{0,31}\.(?:NS|BO)", requested_symbol):
+        raise HTTPException(status_code=422, detail="Invalid NSE/BSE symbol.")
+    if not _is_nse_market_open():
+        raise HTTPException(status_code=409, detail="Paper market orders are available only during NSE/BSE market hours (09:15-15:30 IST).")
     settings = db.get_settings(user_id)
     api_key = settings.get("av_key", "") or os.getenv("ALPHA_VANTAGE_KEY", "")
     quote = md.fetch_price(requested_symbol, api_key)
+    if not _quote_is_fresh(quote):
+        # Alpha Vantage's global quote exposes only a trading date. Fall back to
+        # timestamped intraday data rather than treating a date-only price as live.
+        quote = md.get_yf_price(requested_symbol)
+        if not _quote_is_fresh(quote):
+            raise HTTPException(status_code=503, detail="A fresh market quote is unavailable for this order.")
     try:
         execution_price = float(quote["price"])
     except (KeyError, TypeError, ValueError, OverflowError):
         raise HTTPException(status_code=503, detail="A verified market price is unavailable for this order.")
     if not math.isfinite(execution_price) or execution_price <= 0:
         raise HTTPException(status_code=503, detail="A verified market price is unavailable for this order.")
-    execution_symbol = quote.get("symbol") or requested_symbol
+    execution_symbol = str(quote.get("symbol") or "").strip().upper()
+    if execution_symbol != requested_symbol:
+        raise HTTPException(status_code=503, detail="Quote symbol did not match the requested order symbol.")
     res = db.execute_trade(
         user_id,
         execution_symbol,
@@ -515,8 +571,13 @@ def refresh_intraday_scan(_user_id=Depends(get_current_user_id)):
 @app.post("/api/ai-intraday/sessions")
 def create_or_update_session(payload: AISessionPayload, user_id=Depends(get_current_user_id)):
     try:
-        session_id = db.save_ai_session(payload.model_dump(), user_id)
+        session_data = payload.model_dump()
+        if len(json.dumps(session_data, allow_nan=False, default=str).encode("utf-8")) > 1_000_000:
+            raise HTTPException(status_code=413, detail="Session journal payload is too large.")
+        session_id = db.save_ai_session(session_data, user_id)
         return {"status": "ok", "session_id": session_id}
+    except HTTPException:
+        raise
     except PermissionError:
         raise HTTPException(status_code=403, detail="Session belongs to another user.")
     except (TypeError, ValueError) as exc:

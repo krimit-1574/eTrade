@@ -4,7 +4,7 @@ import { PaperBroker, ORDER_STATUS, POSITION_STATUS } from '../PaperBroker';
 
 // Mock sessionStorage for Node/Vitest environment
 const mockStorage = {};
-global.sessionStorage = {
+globalThis.sessionStorage = {
   getItem: (key) => mockStorage[key] || null,
   setItem: (key, val) => { mockStorage[key] = val; },
   removeItem: (key) => { delete mockStorage[key]; },
@@ -49,6 +49,17 @@ describe('Paper Trading Engine', () => {
       const updated = PaperTradingAccount.updateMarketPrice(account, 105);
       expect(updated.unrealizedPnL).toBe(50); // (105-100)*10
       expect(updated.activePosition.currentPrice).toBe(105);
+    });
+
+    it('refuses the symbol-less price update when multiple positions are open', () => {
+      account.activePositions = [
+        { symbol: 'AAA', direction: 'LONG', quantity: 1, entryPrice: 100, currentPrice: 100, unrealizedPnL: 0 },
+        { symbol: 'BBB', direction: 'LONG', quantity: 1, entryPrice: 200, currentPrice: 200, unrealizedPnL: 0 },
+      ];
+
+      PaperTradingAccount.updateMarketPrice(account, 999);
+
+      expect(account.activePositions.map(position => position.currentPrice)).toEqual([100, 200]);
     });
   });
 
@@ -197,11 +208,74 @@ describe('Paper Trading Engine', () => {
       expect(order).toBeNull();
       expect(events.some(e => e.title.includes('rejected'))).toBe(true);
     });
+
+    it('rejects an unaffordable custom market quantity instead of silently shrinking it', () => {
+      account.availableCash = 1000;
+      const before = JSON.stringify(account);
+
+      const result = PaperBroker.executeMarketOrder(account, {
+        symbol: 'TEST', direction: 'LONG', entry: 100,
+        stopLoss: 95, target1: 110, target2: 120, customQuantity: 20,
+      });
+
+      expect(result.order).toBeNull();
+      expect(result.position).toBeNull();
+      expect(result.events.at(-1).detail).toMatch(/insufficient paper balance/i);
+      expect(JSON.stringify(account)).toBe(before);
+    });
+
+    it('rejects fractional market quantities and inverted targets', () => {
+      const fractional = PaperBroker.executeMarketOrder(account, {
+        symbol: 'AAA', direction: 'LONG', entry: 100,
+        stopLoss: 95, target1: 110, target2: 120, customQuantity: 1.5,
+      });
+      const invertedTargets = PaperBroker.executeMarketOrder(account, {
+        symbol: 'BBB', direction: 'LONG', entry: 100,
+        stopLoss: 95, target1: 120, target2: 110, customQuantity: 1,
+      });
+
+      expect(fractional.order).toBeNull();
+      expect(invertedTargets.order).toBeNull();
+      expect(account.activePositions).toHaveLength(0);
+    });
+
+    it('does not spend cash reserved by pending entries', () => {
+      account = PaperTradingAccount.reset({
+        initialCapital: 10000, maxSimultaneousPositions: 4, slippage: 0, spread: 0, commission: 20,
+      });
+      PaperBroker.createLimitOrder(account, {
+        symbol: 'AAA', direction: 'LONG', limitPrice: 100,
+        quantity: 60, stopLoss: 95, target1: 110,
+      });
+
+      const market = PaperBroker.executeMarketOrder(account, {
+        symbol: 'BBB', direction: 'LONG', entry: 100,
+        customQuantity: 50, stopLoss: 95, target1: 110,
+      });
+
+      expect(market.order).toBeNull();
+      expect(account.pendingOrders).toHaveLength(1);
+      expect(account.availableCash).toBe(10000);
+    });
+
+    it('rolls daily P&L before charging the first order of a new day', () => {
+      account.tradingDate = '2000-01-01';
+      account.dailyPnL = -500;
+      account.config = { ...account.config, slippage: 0, spread: 0, commission: 20 };
+
+      PaperBroker.executeMarketOrder(account, {
+        symbol: 'AAA', direction: 'LONG', entry: 100,
+        customQuantity: 1, stopLoss: 95, target1: 110,
+      });
+
+      expect(account.dailyPnL).toBe(-20);
+      expect(account.tradingDate).not.toBe('2000-01-01');
+    });
   });
 
   describe('PaperBroker - Limit and Stop Orders', () => {
     it('creates and evaluates a pending limit buy order', () => {
-      const { order, events } = PaperBroker.createLimitOrder(account, {
+      const { order } = PaperBroker.createLimitOrder(account, {
         symbol: 'TCS',
         direction: 'LONG',
         limitPrice: 3800,
@@ -242,9 +316,137 @@ describe('Paper Trading Engine', () => {
       expect(cancelledOrder.status).toBe(ORDER_STATUS.CANCELLED);
       expect(account.pendingOrders.length).toBe(0);
     });
+
+    it('does not evaluate one stock order using another stock price', () => {
+      account = PaperTradingAccount.reset({ initialCapital: 100000, maxSimultaneousPositions: 4 });
+      PaperBroker.createLimitOrder(account, {
+        symbol: 'TCS', direction: 'LONG', limitPrice: 3800, quantity: 5, stopLoss: 3750, target1: 3900,
+      });
+      PaperBroker.createLimitOrder(account, {
+        symbol: 'INFY', direction: 'LONG', limitPrice: 1500, quantity: 5, stopLoss: 1470, target1: 1560,
+      });
+
+      const ambiguous = PaperBroker.evaluatePendingOrders(account, 1495, 1510, 1490);
+      expect(ambiguous.filledOrders).toHaveLength(0);
+      expect(ambiguous.events[0].detail).toContain('target symbol');
+
+      const targeted = PaperBroker.evaluatePendingOrders(account, 1495, 1510, 1490, 'INFY');
+      expect(targeted.filledOrders).toHaveLength(1);
+      expect(targeted.filledOrders[0].symbol).toBe('INFY');
+      expect(account.pendingOrders.map((order) => order.symbol)).toEqual(['TCS']);
+      expect(account.realizedPnL).toBe(-20);
+      expect(account.dailyPnL).toBe(-20);
+    });
+
+    it('reserves buying power across pending orders', () => {
+      account = PaperTradingAccount.reset({ initialCapital: 10000, maxSimultaneousPositions: 4, slippage: 0, spread: 0, commission: 20 });
+      const first = PaperBroker.createLimitOrder(account, {
+        symbol: 'AAA', direction: 'LONG', limitPrice: 100, quantity: 60, stopLoss: 95, target1: 110,
+      });
+      const second = PaperBroker.createLimitOrder(account, {
+        symbol: 'BBB', direction: 'LONG', limitPrice: 100, quantity: 60, stopLoss: 95, target1: 110,
+      });
+
+      expect(first.order).not.toBeNull();
+      expect(second.order).toBeNull();
+      expect(second.events[0].detail).toContain('uncommitted');
+    });
+
+    it('rejects fractional quantities and invalid protective levels', () => {
+      const fractional = PaperBroker.createLimitOrder(account, {
+        symbol: 'AAA', direction: 'LONG', limitPrice: 100, quantity: 1.5, stopLoss: 95, target1: 110,
+      });
+      const badStop = PaperBroker.createStopOrder(account, {
+        symbol: 'BBB', direction: 'LONG', stopPrice: 100, quantity: 1, stopLoss: 105, target1: 110,
+      });
+
+      expect(fractional.order).toBeNull();
+      expect(badStop.order).toBeNull();
+    });
+
+    it('fills stop entries at an adverse gap price, not the trigger price', () => {
+      account = PaperTradingAccount.reset({ initialCapital: 100000, maxSimultaneousPositions: 4, slippage: 0, spread: 0, commission: 0 });
+      PaperBroker.createStopOrder(account, {
+        symbol: 'AAA', direction: 'LONG', stopPrice: 100,
+        quantity: 10, stopLoss: 95, target1: 120,
+      });
+
+      const result = PaperBroker.evaluatePendingOrders(account, 110, 112, 109, 'AAA');
+
+      expect(result.filledOrders).toHaveLength(1);
+      expect(result.filledOrders[0].fillPrice).toBe(110);
+      expect(account.activePositions[0].entryPrice).toBe(110);
+    });
+  });
+
+  describe('PaperBroker - P&L Accounting', () => {
+    it('attributes every commission and recalculates unrealized P&L after a partial exit', () => {
+      account = PaperTradingAccount.reset({ initialCapital: 100000, slippage: 0, spread: 0, commission: 20 });
+      PaperBroker.executeMarketOrder(account, {
+        symbol: 'TEST', direction: 'LONG', entry: 100, stopLoss: 95, target1: 110, target2: 120, customQuantity: 10,
+      });
+      PaperTradingAccount.updateMarketPrice(account, 'TEST', 110);
+
+      const partial = PaperBroker.closePosition(account, 110, 'Target 1', 5, 'TEST');
+      expect(partial.closedFully).toBe(false);
+      expect(account.activePosition.quantity).toBe(5);
+      expect(account.activePosition.unrealizedPnL).toBe(50);
+      expect(account.activePosition.realizedPnL).toBe(10); // -20 entry + 30 partial exit
+      expect(account.realizedPnL).toBe(10);
+
+      const final = PaperBroker.closePosition(account, 120, 'Target 2', null, 'TEST');
+      expect(final.closedFully).toBe(true);
+      expect(account.realizedPnL).toBe(90); // 150 gross - 3 commissions
+      expect(account.closedPositions[0].realizedPnL).toBe(90);
+      expect(account.closedPositions[0].quantity).toBe(10);
+      expect(account.closedPositions[0].finalExitQuantity).toBe(5);
+      expect(account.closedPositions[0].pnlPct).toBeCloseTo(9, 4);
+      expect(account.availableCash).toBe(100090);
+    });
+
+    it('rejects invalid partial quantities and exit prices without mutating the position', () => {
+      account = PaperTradingAccount.reset({ initialCapital: 100000, slippage: 0, spread: 0, commission: 20 });
+      PaperBroker.executeMarketOrder(account, {
+        symbol: 'TEST', direction: 'LONG', entry: 100, stopLoss: 95, target1: 110, customQuantity: 10,
+      });
+
+      expect(PaperBroker.closePosition(account, 110, 'Bad partial', 0.5).closedFully).toBe(false);
+      expect(PaperBroker.closePosition(account, Number.NaN, 'Bad price').closedFully).toBe(false);
+      expect(account.activePosition.quantity).toBe(10);
+      expect(account.realizedPnL).toBe(-20);
+    });
   });
 
   describe('PaperBroker - Position Exit Triggers', () => {
+    it('requires a symbol when multiple positions are open', () => {
+      account.activePositions = [
+        { symbol: 'AAA', direction: 'LONG', quantity: 1, entryPrice: 100, stopLoss: 95, target1: 110 },
+        { symbol: 'BBB', direction: 'LONG', quantity: 1, entryPrice: 200, stopLoss: 190, target1: 220 },
+      ];
+
+      const close = PaperBroker.closePosition(account, 100);
+      const stop = PaperBroker.updateStopLoss(account, 99);
+      const trigger = PaperBroker.checkPositionExitTriggers(account, 90, 100, 90);
+
+      expect(close.closedFully).toBe(false);
+      expect(stop.updated).toBe(false);
+      expect(trigger.closed).toBe(false);
+      expect(account.activePositions).toHaveLength(2);
+    });
+
+    it('fills a breached long stop at the adverse gap price', () => {
+      account = PaperTradingAccount.reset({ initialCapital: 100000, slippage: 0, spread: 0, commission: 0 });
+      PaperBroker.executeMarketOrder(account, {
+        symbol: 'AAA', direction: 'LONG', entry: 100,
+        customQuantity: 10, stopLoss: 95, target1: 110,
+      });
+
+      const result = PaperBroker.checkPositionExitTriggers(account, 80, 90, 80, 'AAA');
+
+      expect(result.closed).toBe(true);
+      expect(account.closedPositions[0].exitPrice).toBe(80);
+      expect(account.closedPositions[0].realizedPnL).toBe(-200);
+    });
     it('auto-closes position when stop loss is hit', () => {
       PaperBroker.executeMarketOrder(account, {
         symbol: 'SBIN',
@@ -284,4 +486,3 @@ describe('Paper Trading Engine', () => {
     });
   });
 });
-

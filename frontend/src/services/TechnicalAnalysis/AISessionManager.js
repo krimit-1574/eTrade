@@ -51,6 +51,8 @@ const TIMEFRAME_CONFIG = {
   '30m': { period: '1mo', interval: '30m' },
 };
 
+const MAX_QUOTE_AGE_MS = 30_000;
+
 function normalizeSymbol(symbol) {
   return String(symbol || '').trim().toUpperCase().replace(/\.NS$/, '');
 }
@@ -92,6 +94,8 @@ function createSessionState(symbol, config = {}) {
     // A session is safe to trade only after both quote and candle feeds succeed.
     isStaleData: true,
     lastTickTime: null,
+    quoteAsOf: null,
+    quoteProvider: null,
 
     // Analysis
     technicalAnalysis: null,
@@ -130,6 +134,9 @@ function createSessionState(symbol, config = {}) {
     _candleStale: true,
     _stopPromise: null,
     _journal: null,
+    _decisionSignature: null,
+    _lastRejectionCode: null,
+    _lastExecutionAttemptAt: 0,
   };
 }
 
@@ -196,6 +203,8 @@ export class AISessionManagerSingleton {
       this._contextInterval = setInterval(() => this._refreshMarketContext(), 60000);
     }
 
+    this._rehydratePersistedPositions();
+
     this._notifyListeners();
   }
 
@@ -236,12 +245,62 @@ export class AISessionManagerSingleton {
     }
     // A settings change may make a previously rejected signal eligible again.
     for (const session of this.getActiveSessions()) {
-      if (session.status === SESSION_STATUS.RISK_LIMIT) session.hasExecuted = false;
+      if (session._lastRejectionCode) {
+        session.hasExecuted = false;
+        session._lastRejectionCode = null;
+      }
     }
     this._notifyListeners();
   }
 
   // ─── Session Lifecycle ───────────────────────────────────────
+  _rehydratePersistedPositions() {
+    const positions = Array.isArray(this.account?.activePositions)
+      ? this.account.activePositions
+      : (this.account?.activePosition ? [this.account.activePosition] : []);
+    let accountChanged = false;
+
+    for (const position of positions) {
+      const cleanSymbol = normalizeSymbol(position?.symbol);
+      if (!cleanSymbol || this.sessions.has(cleanSymbol)) continue;
+
+      const session = createSessionState(cleanSymbol, {
+        userId: this.userId,
+        startingCapital: this.account?.initialCapital ?? this.account?.accountValue,
+      });
+      if (position.sessionId) {
+        session.id = position.sessionId;
+      } else {
+        // Legacy positions predate session ownership. Attach them now so the
+        // eventual close is included in exactly this session's journal.
+        position.sessionId = session.id;
+        accountChanged = true;
+      }
+      session.startedAt = position.entryTime || session.startedAt;
+      session.price = toFiniteNumber(position.currentPrice, toFiniteNumber(position.entryPrice));
+      session.lastTickTime = null;
+      session._priceStale = true;
+      session._candleStale = true;
+      session.isStaleData = true;
+      session.status = SESSION_STATUS.POSITION_ACTIVE;
+      // Do not immediately re-enter the same signal after this restored
+      // position exits; wait until the strategy emits a different decision.
+      session.hasExecuted = true;
+      this.sessions.set(cleanSymbol, session);
+      this._syncPositionSummary(cleanSymbol);
+      session.tradeLevels = {
+        entry: position.entryPrice,
+        stopLoss: position.stopLoss,
+        target1: position.target1,
+        target2: position.target2,
+        direction: position.direction,
+      };
+      this._startSessionPolling(cleanSymbol);
+    }
+
+    if (accountChanged) this._saveAccount();
+  }
+
   /**
    * Starts a new AI intraday session for the given symbol.
    * If a session already exists for this symbol, returns the existing one.
@@ -286,9 +345,15 @@ export class AISessionManagerSingleton {
     // Resume ownership of a persisted open position after a page refresh so
     // the eventual journal includes the original trade rather than orphaning it.
     const existingPosition = this._getPositionForSymbol(cleanSymbol);
-    if (existingPosition?.sessionId) {
-      session.id = existingPosition.sessionId;
+    if (existingPosition) {
+      if (existingPosition.sessionId) {
+        session.id = existingPosition.sessionId;
+      } else {
+        existingPosition.sessionId = session.id;
+        this._saveAccount();
+      }
       session.startedAt = existingPosition.entryTime || session.startedAt;
+      session.hasExecuted = true;
     }
     this.sessions.set(cleanSymbol, session);
     this._syncPositionSummary(cleanSymbol);
@@ -323,11 +388,10 @@ export class AISessionManagerSingleton {
   async _stopSession(session) {
     const { symbol } = session;
     session.isActive = false;
-    session.status = SESSION_STATUS.STOPPED;
-    session.stoppedAt = new Date().toISOString();
     session._priceRequestId += 1;
     session._candleRequestId += 1;
     this._stopSessionPolling(symbol);
+    let liquidationFailed = false;
 
     await this._executeWithLock(async () => {
       const position = this._getPositionForSymbol(symbol);
@@ -339,6 +403,7 @@ export class AISessionManagerSingleton {
         .map(Number)
         .find(price => Number.isFinite(price) && price > 0);
       if (!exitPrice) {
+        liquidationFailed = true;
         session.timeline.push(this._timelineEvent(
           'Position could not be liquidated',
           'No valid market or position price is available. The position remains open.',
@@ -358,8 +423,29 @@ export class AISessionManagerSingleton {
       this._saveAccount();
       session.timeline.push(...(result.events || []));
       this._syncPositionSummary(symbol);
-      if (!session.hasPosition) session.tradeLevels = null;
+      if (result.closedFully !== true || session.hasPosition) {
+        liquidationFailed = true;
+        session.timeline.push(this._timelineEvent(
+          'Position could not be liquidated',
+          result.reason || 'The paper broker rejected the closing order. The session remains active.',
+          'error'
+        ));
+      } else {
+        session.tradeLevels = null;
+      }
     });
+
+    if (liquidationFailed || this._hasPositionForSymbol(symbol)) {
+      session.isActive = true;
+      session.stoppedAt = null;
+      session.status = SESSION_STATUS.POSITION_ACTIVE;
+      this._startSessionPolling(symbol);
+      this._notifyListeners();
+      return null;
+    }
+
+    session.status = SESSION_STATUS.STOPPED;
+    session.stoppedAt = new Date().toISOString();
 
     let sessionData = null;
     try {
@@ -441,7 +527,17 @@ export class AISessionManagerSingleton {
 
     // Price tick every 10 seconds
     session._priceInterval = setInterval(() => {
-      if (session.isActive) void this._fetchPrice(symbol);
+      if (session.isActive) {
+        const wasStale = session.isStaleData;
+        this._syncStaleState(session);
+        if (!wasStale && session.isStaleData) {
+          if (session.status !== SESSION_STATUS.POSITION_ACTIVE) {
+            session.status = SESSION_STATUS.DATA_DISCONNECTED;
+          }
+          this._notifyListeners();
+        }
+        void this._fetchPrice(symbol);
+      }
     }, 10000);
 
     // Candle refresh every 30 seconds
@@ -474,13 +570,16 @@ export class AISessionManagerSingleton {
       if (!this._isCurrentRequest(symbol, session, '_priceRequestId', requestId)) return;
 
       const price = Number(res?.price);
-      if (res?.price !== 'N/A' && Number.isFinite(price) && price > 0) {
+      const providerReportsDelay = res?.is_delayed === true || res?.isDelayed === true;
+      if (res?.price !== 'N/A' && Number.isFinite(price) && price > 0 && !providerReportsDelay) {
         session.price = price;
         session.change = toFiniteNumber(res.change);
         session.changePct = toFiniteNumber(res.pct ?? res.changePct);
         session._priceStale = false;
-        this._syncStaleState(session);
         session.lastTickTime = Date.now();
+        session.quoteAsOf = res?.as_of || null;
+        session.quoteProvider = res?.provider || null;
+        this._syncStaleState(session);
 
         // Run position management on each tick
         await this._evaluatePosition(symbol, session);
@@ -516,12 +615,14 @@ export class AISessionManagerSingleton {
       if (!this._isCurrentRequest(symbol, session, '_candleRequestId', requestId)) return;
 
       let candles = Array.isArray(res?.data) ? res.data : [];
+      let usedFallbackTimeframe = false;
 
       if (candles.length === 0) {
         // Fallback to longer timeframe
         const fallbackRes = await api.getHistory(session.formattedSymbol, '5d', '15m');
         if (!this._isCurrentRequest(symbol, session, '_candleRequestId', requestId)) return;
         candles = Array.isArray(fallbackRes?.data) ? fallbackRes.data : [];
+        usedFallbackTimeframe = candles.length > 0;
       }
 
       if (candles.length === 0) {
@@ -535,6 +636,17 @@ export class AISessionManagerSingleton {
       }
 
       session.chartData = candles;
+      if (usedFallbackTimeframe) {
+        // A 15-minute fallback can keep the chart informative, but it must not
+        // be traded as though it were the requested timeframe.
+        session._candleStale = true;
+        this._syncStaleState(session);
+        if (session.status !== SESSION_STATUS.POSITION_ACTIVE) {
+          session.status = SESSION_STATUS.DATA_DISCONNECTED;
+        }
+        this._notifyListeners();
+        return;
+      }
       session._candleStale = false;
       this._syncStaleState(session);
       session.marketContext = this.marketContext;
@@ -575,12 +687,34 @@ export class AISessionManagerSingleton {
         this.marketContext
       );
       session.tradeDecision = decision;
+      const decisionSignature = JSON.stringify([
+        decision.decision,
+        decision.direction,
+        decision.setup,
+        decision.entry,
+        decision.stopLoss,
+        decision.target1,
+        decision.target2,
+      ]);
+      if (session._decisionSignature !== decisionSignature && !this._hasPositionForSymbol(symbol)) {
+        session.hasExecuted = false;
+        session._lastRejectionCode = null;
+      }
+      session._decisionSignature = decisionSignature;
+      if (
+        session._lastRejectionCode
+        && Date.now() - session._lastExecutionAttemptAt >= 30_000
+      ) {
+        session.hasExecuted = false;
+      }
 
       // Update session status based on decision
       if (this._hasPositionForSymbol(symbol)) {
         session.status = SESSION_STATUS.POSITION_ACTIVE;
       } else if (session.isStaleData) {
         session.status = SESSION_STATUS.DATA_DISCONNECTED;
+      } else if (session.hasExecuted && session._lastRejectionCode) {
+        session.status = SESSION_STATUS.RISK_LIMIT;
       } else if (decision.decision === 'BUY' || decision.decision === 'SHORT') {
         session.status = SESSION_STATUS.RUNNING;
       } else if (decision.invalidation?.includes('waiting')) {
@@ -626,6 +760,7 @@ export class AISessionManagerSingleton {
       // Reset execution flag when decision returns to WAIT
       if (decision.decision === 'WAIT') {
         session.hasExecuted = false;
+        session._lastRejectionCode = null;
       }
 
     } catch (err) {
@@ -641,6 +776,7 @@ export class AISessionManagerSingleton {
     if (!session || session !== (expectedSession || session) || !session.isActive) return;
 
     // Stale data guard
+    this._syncStaleState(session);
     if (session.isStaleData) {
       session.timeline.push({
         id: Date.now(),
@@ -659,7 +795,7 @@ export class AISessionManagerSingleton {
       if (
         this.sessions.get(symbol) !== session ||
         !session.isActive ||
-        session.isStaleData ||
+        this._isSessionDataStale(session) ||
         session.tradeDecision !== decision ||
         this._hasPositionForSymbol(symbol) ||
         session.hasExecuted
@@ -668,12 +804,20 @@ export class AISessionManagerSingleton {
       }
 
       session.hasExecuted = true;
+      session._lastExecutionAttemptAt = Date.now();
 
       // Risk Engine validation (atomic)
       const validation = RiskEngine.validateTrade({
         account: this.account,
         decision,
-        stockInfo: { sym: session.symbol, price: session.price },
+        stockInfo: {
+          sym: session.symbol,
+          price: session.price,
+          isStaleData: this._isSessionDataStale(session),
+          lastTickTime: session.lastTickTime,
+          quoteAsOf: session.quoteAsOf,
+          quoteProvider: session.quoteProvider,
+        },
         customSettings: this.riskSettings,
       });
 
@@ -695,6 +839,7 @@ export class AISessionManagerSingleton {
       if (session.decisions.length > 500) session.decisions.splice(0, session.decisions.length - 500);
 
       if (!validation.approved) {
+        session._lastRejectionCode = validation.code;
         session.timeline.push({
           id: Date.now(),
           time: new Date().toLocaleTimeString('en-US', { hour12: true }),
@@ -705,6 +850,8 @@ export class AISessionManagerSingleton {
         session.status = SESSION_STATUS.RISK_LIMIT;
         return;
       }
+
+      session._lastRejectionCode = null;
 
       // Execute paper order
       const execution = PaperBroker.executeMarketOrder(
@@ -729,6 +876,7 @@ export class AISessionManagerSingleton {
       const orderEvents = execution.events || [];
       const pos = this._getPositionForSymbol(symbol);
       if (!execution.order || !pos || (pos.sessionId && pos.sessionId !== session.id)) {
+        session._lastRejectionCode = 'BROKER_REJECTED';
         session.timeline.push(...orderEvents);
         session.timeline.push(this._timelineEvent(
           'Paper order was not filled',
@@ -961,7 +1109,14 @@ export class AISessionManagerSingleton {
   }
 
   _syncStaleState(session) {
-    session.isStaleData = Boolean(session._priceStale || session._candleStale);
+    session.isStaleData = this._isSessionDataStale(session);
+  }
+
+  _isSessionDataStale(session) {
+    const lastTickTime = Number(session?.lastTickTime);
+    const quoteExpired = !Number.isFinite(lastTickTime)
+      || Date.now() - lastTickTime > MAX_QUOTE_AGE_MS;
+    return Boolean(session?._priceStale || session?._candleStale || quoteExpired);
   }
 
   _timelineEvent(title, detail, type = 'info') {
@@ -1035,11 +1190,13 @@ export class AISessionManagerSingleton {
           technicalAnalysis: session.technicalAnalysis,
           tradeDecision: session.tradeDecision,
           chartData: session.chartData,
-          isStaleData: session.isStaleData,
+          isStaleData: this._isSessionDataStale(session),
           startedAt: session.startedAt,
           stoppedAt: session.stoppedAt,
           timeframe: session.timeframe,
           lastTickTime: session.lastTickTime,
+          quoteAsOf: session.quoteAsOf,
+          quoteProvider: session.quoteProvider,
           decisions: [...session.decisions],
           userId: session.userId,
         }])
@@ -1058,28 +1215,53 @@ export class AISessionManagerSingleton {
   async manualClosePosition(symbol) {
     const cleanSymbol = normalizeSymbol(symbol);
     const session = this.sessions.get(cleanSymbol);
-    if (!session) return;
+    if (!session) return false;
 
-    if (this._hasPositionForSymbol(cleanSymbol) && session.price > 0) {
-      await this._executeWithLock(async () => {
-        if (this.sessions.get(cleanSymbol) !== session || !this._hasPositionForSymbol(cleanSymbol)) return;
-        const { account: updated, events } = PaperBroker.closePosition(
+    const position = this._getPositionForSymbol(cleanSymbol);
+    if (!position) return false;
+    const exitPrice = [session.price, position.currentPrice, position.entryPrice]
+      .map(Number)
+      .find(price => Number.isFinite(price) && price > 0);
+    if (!exitPrice) {
+      session.timeline.push(this._timelineEvent(
+        'Manual exit failed',
+        'No valid market or position price is available.',
+        'error'
+      ));
+      this._notifyListeners();
+      return false;
+    }
+
+    let closed = false;
+    await this._executeWithLock(async () => {
+      if (this.sessions.get(cleanSymbol) !== session || !this._hasPositionForSymbol(cleanSymbol)) return;
+      const result = PaperBroker.closePosition(
           this.account,
-          session.price,
+          exitPrice,
           'Manual exit by trader',
           null,
           cleanSymbol
-        );
-        this.account = updated;
-        this._saveAccount();
-        session.timeline.push(...events);
+      );
+      this.account = result.account;
+      this._saveAccount();
+      session.timeline.push(...(result.events || []));
+      closed = result.closedFully === true;
+      if (closed) {
         session.hasPosition = false;
         session.positionSummary = null;
         session.tradeLevels = null;
         session.status = SESSION_STATUS.WAITING;
-      });
-      this._notifyListeners();
-    }
+      } else {
+        this._syncPositionSummary(cleanSymbol);
+        session.timeline.push(this._timelineEvent(
+          'Manual exit failed',
+          result.reason || 'The paper broker rejected the closing order.',
+          'error'
+        ));
+      }
+    });
+    this._notifyListeners();
+    return closed;
   }
 
   /**

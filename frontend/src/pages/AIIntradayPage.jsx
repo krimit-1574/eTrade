@@ -12,6 +12,13 @@ import { MarketContextService } from '../services/TechnicalAnalysis/MarketContex
 import { PaperTradingAccount } from '../services/TechnicalAnalysis/PaperTradingAccount';
 import { useAISessionManager } from '../hooks/useAISessionManager';
 
+function toIstDateKey(value) {
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return '';
+  const ist = new Date(timestamp + (5.5 * 60 * 60 * 1000));
+  return `${ist.getUTCFullYear()}-${String(ist.getUTCMonth() + 1).padStart(2, '0')}-${String(ist.getUTCDate()).padStart(2, '0')}`;
+}
+
 export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackToDashboard }) {
   const [aiState, setAiState] = useState('READY');
   const [isLoading, setIsLoading] = useState(true);
@@ -23,8 +30,6 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
   const [isFallback, setIsFallback] = useState(false);
   const [error, setError] = useState(null);
   const [selectedSession, setSelectedSession] = useState(null);
-  const [paperAccount, setPaperAccount] = useState(() => PaperTradingAccount.load());
-
   // Multi-Session Manager Hook
   const {
     sessions,
@@ -34,15 +39,9 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
     startSession,
     stopSession,
     stopAllSessions,
-    isSessionActive,
-  } = useAISessionManager();
+  } = useAISessionManager(user?.user_id);
 
-  // Sync paper account from manager when it updates
-  useEffect(() => {
-    if (managerAccount) {
-      setPaperAccount(managerAccount);
-    }
-  }, [managerAccount]);
+  const paperAccount = managerAccount || PaperTradingAccount.load();
 
   // Fetch market context (NIFTY, BANK NIFTY, SENSEX) — fallback if manager hasn't loaded it
   const [localMarketContext, setLocalMarketContext] = useState(null);
@@ -81,7 +80,6 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
 
   useEffect(() => {
     if (!activeSymbol) {
-      setPaperAccount(PaperTradingAccount.load());
       runScanner(false);
     }
   }, [runScanner, activeSymbol]);
@@ -92,7 +90,11 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
 
   // Start AI session via the session manager (multi-stock support)
   const handleStartAI = useCallback((symbol) => {
-    startSession(symbol);
+    const started = startSession(symbol);
+    if (!started) {
+      setError({ message: 'Unable to start another AI session. Check the symbol and session limit.' });
+      return;
+    }
     onStartAI(symbol);
   }, [startSession, onStartAI]);
 
@@ -124,6 +126,7 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
     return (
       <AIIntradayWorkspace
         symbol={activeSymbol}
+        userId={user?.user_id}
         onBack={onBackToDashboard}
         onSelectSymbol={handleViewSession}
       />
@@ -222,10 +225,17 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
       <AIIntradayStats
         marketStatus={marketStatus}
         aiStatus={aiState}
-        paperBalance={paperAccount.accountValue || paperAccount.availableCash || 100000}
-        todayPnL={paperAccount.dailyPnL || 0}
-        todayTrades={(paperAccount.closedPositions?.length || 0) + (paperAccount.activePosition ? 1 : 0)}
-        activePositions={activeCount}
+        paperBalance={paperAccount.accountValue ?? paperAccount.availableCash ?? 100000}
+        todayPnL={paperAccount.dailyPnL ?? 0}
+        todayTrades={[
+          ...(paperAccount.closedPositions || []).filter(position =>
+            toIstDateKey(position.exitTime || position.entryTime) === paperAccount.tradingDate
+          ),
+          ...(paperAccount.activePositions || []).filter(position =>
+            toIstDateKey(position.entryTime) === paperAccount.tradingDate
+          ),
+        ].length}
+        activePositions={(paperAccount.activePositions || []).length}
         marketStatusNote={marketStatusNote}
         onAiStateChange={(newState) => setAiState(newState)}
       />
@@ -246,7 +256,7 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
 
       {/* Past AI Trading Sessions Journal */}
       <AIPastSessionsList
-        userId={user?.id}
+        userId={user?.user_id}
         onSelectSession={(session) => setSelectedSession(session)}
       />
 

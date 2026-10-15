@@ -40,9 +40,9 @@ export default function MultiAIOverviewPanel({
       totalUnrealized,
       positionsCount,
       waitingCount,
-      balance: account?.accountValue || account?.availableCash || 100000,
-      realizedPnL: account?.realizedPnL || 0,
-      dailyPnL: account?.dailyPnL || 0,
+      balance: account?.accountValue ?? account?.availableCash ?? 100000,
+      realizedPnL: account?.realizedPnL ?? 0,
+      dailyPnL: account?.dailyPnL ?? 0,
     };
   }, [sessionList, account]);
 
@@ -166,7 +166,6 @@ export default function MultiAIOverviewPanel({
 
 function SessionCard({ session, onView, onStop }) {
   const isPositive = session.changePct >= 0;
-  const hasPnL = session.positionSummary?.unrealizedPnL !== undefined;
   const pnl = session.positionSummary?.unrealizedPnL || 0;
   const pnlPct = session.positionSummary?.pnlPct || 0;
   const isPnlPositive = pnl >= 0;
@@ -203,7 +202,7 @@ function SessionCard({ session, onView, onStop }) {
           <span style={{ fontWeight: '800', fontSize: '0.92rem', color: 'var(--text-primary)' }}>
             {session.symbol}
           </span>
-          <AIStatusBadge status={session.status} size="sm" />
+        <AIStatusBadge state={session.status} size="sm" />
         </div>
 
         <button

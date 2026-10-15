@@ -4,7 +4,6 @@ import {
   TrendingUp, TrendingDown, Clock, ShieldCheck, Activity, BarChart2,
   FileText, Award, Minimize2, LayoutGrid, Monitor
 } from 'lucide-react';
-import { api } from '../../api';
 import AIStatusBadge from './AIStatusBadge';
 import AIBiasBadge from './AIBiasBadge';
 import AIIntradayChart from './AIIntradayChart';
@@ -14,13 +13,8 @@ import AIIntradayTradePlanPanel from './AIIntradayTradePlanPanel';
 import AIIntradayTimelinePanel from './AIIntradayTimelinePanel';
 import MultiStockWorkspaceGrid from './MultiStockWorkspaceGrid';
 import { useAISessionManager, useAISession } from '../../hooks/useAISessionManager';
-import { SetupAnalyzer } from '../../services/TechnicalAnalysis/SetupAnalyzer';
-import { AITradingDecisionEngine } from '../../services/TechnicalAnalysis/AITradingDecisionEngine';
-import { StrategyConfig } from '../../services/TechnicalAnalysis/StrategyConfig';
 import { PaperTradingAccount } from '../../services/TechnicalAnalysis/PaperTradingAccount';
-import { PaperBroker } from '../../services/TechnicalAnalysis/PaperBroker';
 import { RiskEngine } from '../../services/TechnicalAnalysis/RiskEngine';
-import { PositionManager, POSITION_DECISION } from '../../services/TechnicalAnalysis/PositionManager';
 import { SessionJournalService } from '../../services/TechnicalAnalysis/SessionJournalService';
 import { MarketContextService } from '../../services/TechnicalAnalysis/MarketContextService';
 import AIIntradayRiskBar from './AIIntradayRiskBar';
@@ -65,22 +59,27 @@ function getIndianMarketState() {
   return { status: 'MARKET CLOSED', color: 'var(--red)', isLive: false, note: 'Regular Session Closed (09:15-15:30 IST)' };
 }
 
-export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) {
+export default function AIIntradayWorkspace({ symbol, userId, onBack, onSelectSymbol }) {
   const cleanSymbol = (symbol || 'RELIANCE').toUpperCase().replace('.NS', '');
   const formattedSymbol = cleanSymbol.includes('.') ? cleanSymbol : `${cleanSymbol}.NS`;
 
   // Multi-session hooks and view state
-  const { sessions, activeCount, startSession, stopSession: stopSessionInManager, account: managerAccount, updateRiskSettings } = useAISessionManager();
+  const {
+    sessions,
+    activeCount,
+    startSession,
+    stopSession: stopSessionInManager,
+    account: managerAccount,
+    marketContext,
+    updateRiskSettings,
+  } = useAISessionManager(userId);
   const {
     session,
     isActive,
-    status,
-    price,
     chartData: sessionChartData,
     markers: sessionMarkersFromHook,
     timeline: sessionTimeline,
     tradeLevels: sessionTradeLevels,
-    positionSummary,
     technicalAnalysis: sessionTechnicalAnalysis,
     tradeDecision: sessionTradeDecision,
     isStaleData: sessionIsStaleData,
@@ -88,7 +87,7 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
     closePosition,
     changeTimeframe,
     refreshSession,
-  } = useAISession(cleanSymbol);
+  } = useAISession(cleanSymbol, userId);
 
   const [viewMode, setViewMode] = useState('FOCUS'); // 'FOCUS' or 'MULTI_GRID'
   const marketState = getIndianMarketState();
@@ -130,6 +129,23 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
   const timelineEvents = sessionTimeline || session?.timeline || [];
   const markers = sessionMarkersFromHook || session?.markers || [];
   const tradeLevels = sessionTradeLevels || session?.tradeLevels || null;
+  const sectorInfo = useMemo(
+    () => MarketContextService.getSectorForStock(cleanSymbol),
+    [cleanSymbol],
+  );
+  const calculatedSizing = useMemo(() => {
+    if (!tradeDecision || tradeDecision.decision === 'WAIT' || !tradeDecision.entry || !tradeDecision.stopLoss) {
+      return null;
+    }
+    return RiskEngine.calculatePositionSize({
+      accountValue: account.accountValue,
+      availableCash: account.availableCash,
+      entryPrice: tradeDecision.entry,
+      stopLoss: tradeDecision.stopLoss,
+      settings: riskSettings,
+      currentExposure: account.usedCapital,
+    });
+  }, [tradeDecision, account.accountValue, account.availableCash, account.usedCapital, riskSettings]);
 
   // Auto-start background session if not already created
   const startedRef = useRef(new Set());
@@ -162,7 +178,7 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
       account,
       symbol: cleanSymbol,
       decisions: session?.decisions || [],
-      userId: 'guest',
+      userId: session?.userId || userId,
       sessionId: session?.id,
       startTime: session?.startedAt,
     });
@@ -562,7 +578,7 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
           </div>
 
           {/* Stale Data / Disconnect Warning Banner with Reconnect Action */}
-          {(isStaleData || error) && (
+          {isStaleData && (
             <div
               className="mb-16"
               style={{
@@ -600,18 +616,7 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
           <AIIntradayRiskBar
             account={account}
             riskSettings={riskSettings}
-            calculatedSizing={useMemo(() => {
-              if (tradeDecision && tradeDecision.decision !== 'WAIT' && tradeDecision.entry && tradeDecision.stopLoss) {
-                return RiskEngine.calculatePositionSize({
-                  accountValue: account.accountValue,
-                  availableCash: account.availableCash,
-                  entryPrice: tradeDecision.entry,
-                  stopLoss: tradeDecision.stopLoss,
-                  settings: riskSettings,
-                });
-              }
-              return null;
-            }, [tradeDecision, account.accountValue, account.availableCash, riskSettings])}
+            calculatedSizing={calculatedSizing}
             onOpenSettings={() => setIsRiskModalOpen(true)}
           />
 
@@ -709,4 +714,3 @@ export default function AIIntradayWorkspace({ symbol, onBack, onSelectSymbol }) 
     </div>
   );
 }
-

@@ -1,7 +1,7 @@
 import React from 'react';
 import { Briefcase, Shield, ArrowUpRight, TrendingUp, TrendingDown } from 'lucide-react';
 
-export default function AIIntradayPositionPanel({ position, account, onClosePosition }) {
+export default function AIIntradayPositionPanel({ position, onClosePosition }) {
   const hasPosition = !!position;
   const isLong = hasPosition && position.direction === 'LONG';
   const pnl = hasPosition ? position.unrealizedPnL || 0 : 0;
@@ -12,6 +12,8 @@ export default function AIIntradayPositionPanel({ position, account, onClosePosi
   let duration = '-';
   if (hasPosition && position.entryTime) {
     const entryMs = new Date(position.entryTime).getTime();
+    // Wall-clock time is intentional: duration should reflect time since entry.
+    // eslint-disable-next-line react-hooks/purity
     const nowMs = Date.now();
     const diffMin = Math.floor((nowMs - entryMs) / 60000);
     if (diffMin < 60) duration = `${diffMin}m`;

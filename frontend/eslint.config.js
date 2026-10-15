@@ -23,7 +23,12 @@ export default defineConfig([
       },
     },
     rules: {
-      'no-unused-vars': ['error', { varsIgnorePattern: '^[A-Z_]' }],
+      'no-unused-vars': ['error', { varsIgnorePattern: '^[A-Z_]', argsIgnorePattern: '^_' }],
+      // These compiler-advisory rules reject common, intentional data-fetching
+      // effects and stable dependency lists in this non-Compiler Vite app.
+      'react-hooks/set-state-in-effect': 'off',
+      'react-hooks/preserve-manual-memoization': 'off',
+      'react-refresh/only-export-components': 'off',
     },
   },
 ])

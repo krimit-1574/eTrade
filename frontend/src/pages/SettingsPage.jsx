@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
+import { motion as Motion } from 'framer-motion';
 import { Save, LogOut, Key } from 'lucide-react';
 import { api } from '../api';
 
@@ -47,7 +47,7 @@ export default function SettingsPage({ user, onLogout }) {
         <p>Configure your API keys and preferences.</p>
       </div>
 
-      <motion.div className="card mb-24" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
+      <Motion.div className="card mb-24" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
         <h4 style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '20px' }}>
           <Key size={18} style={{ color: 'var(--gold)' }} /> API Keys
         </h4>
@@ -98,7 +98,7 @@ export default function SettingsPage({ user, onLogout }) {
         </div>
 
         {saved && <div className="success-banner mt-16">Settings saved successfully!</div>}
-      </motion.div>
+      </Motion.div>
 
       <div className="card" style={{ borderColor: 'rgba(248,113,113,0.2)' }}>
         <h4 style={{ marginBottom: '12px' }}>Account</h4>

@@ -148,7 +148,7 @@ export const MarketContextService = {
   /**
    * Determines general market regime from index returns & volatility.
    */
-  determineMarketRegime(niftyChangePct, bankNiftyChangePct, atrOrVol = 0) {
+  determineMarketRegime(niftyChangePct, bankNiftyChangePct, _atrOrVol = 0) {
     const avgChange = (niftyChangePct + bankNiftyChangePct) / 2;
     const spread = Math.abs(niftyChangePct - bankNiftyChangePct);
 

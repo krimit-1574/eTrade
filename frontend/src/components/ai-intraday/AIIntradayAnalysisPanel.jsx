@@ -4,7 +4,6 @@ import AIStatusBadge from './AIStatusBadge';
 import AIBiasBadge from './AIBiasBadge';
 
 export default function AIIntradayAnalysisPanel({
-  stockData = {},
   aiStatus = 'MONITORING',
   bias = 'WAIT',
   aiScore = 75,

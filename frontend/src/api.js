@@ -46,12 +46,16 @@ function notifyUnauthorized() {
 async function request(url, options = {}) {
   const { auth = true, headers: optionHeaders = {}, ...fetchOptions } = options;
   const headers = { 'Content-Type': 'application/json', ...optionHeaders };
-  if (auth && authToken) headers.Authorization = `Bearer ${authToken}`;
+  const sentBearerToken = auth && Boolean(authToken);
+  if (sentBearerToken) headers.Authorization = `Bearer ${authToken}`;
 
   const res = await fetch(`${API}${url}`, { ...fetchOptions, headers });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Request failed' }));
-    if (auth && res.status === 401) notifyUnauthorized();
+    // A 401 only invalidates a browser session when a bearer token was
+    // actually sent. Guest requests have no token and must not be logged out
+    // merely because they touched an authenticated-only feature.
+    if (sentBearerToken && res.status === 401) notifyUnauthorized();
     const error = new Error(formatError(err.detail));
     error.status = res.status;
     throw error;
@@ -63,11 +67,12 @@ async function request(url, options = {}) {
 async function requestBlob(url, options = {}) {
   const { headers: optionHeaders = {}, ...fetchOptions } = options;
   const headers = { ...optionHeaders };
-  if (authToken) headers.Authorization = `Bearer ${authToken}`;
+  const sentBearerToken = Boolean(authToken);
+  if (sentBearerToken) headers.Authorization = `Bearer ${authToken}`;
   const res = await fetch(`${API}${url}`, { ...fetchOptions, headers });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Request failed' }));
-    if (res.status === 401) notifyUnauthorized();
+    if (sentBearerToken && res.status === 401) notifyUnauthorized();
     const error = new Error(formatError(err.detail));
     error.status = res.status;
     throw error;
@@ -168,6 +173,8 @@ export const api = {
   getRecommendations: (_userId) => request('/api/screener/recommendations'),
   refreshRecommendations: (_userId) =>
     request('/api/screener/refresh', { method: 'POST' }),
+  getIntradayScan: () => request('/api/screener/intraday'),
+  refreshIntradayScan: () => request('/api/screener/intraday/refresh', { method: 'POST' }),
 
   // AI intraday sessions. Ownership fields from UI state are deliberately
   // removed; the backend binds every journal to the authenticated account.

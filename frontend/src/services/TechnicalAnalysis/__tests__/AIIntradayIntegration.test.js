@@ -97,7 +97,7 @@ function createBuyDecision(overrides = {}) {
   };
 }
 
-function createShortDecision(overrides = {}) {
+function _createShortDecision(overrides = {}) {
   return {
     decision: 'SHORT',
     direction: 'SHORT',
@@ -372,8 +372,9 @@ describe('AI Intraday Integration (20 Scenarios)', () => {
 
   // ── Scenario 14: Max Trades Per Day Limit ───────────────────────
   it('14. RiskEngine blocks trade when max daily trades exceeded', () => {
+    const exitTime = new Date().toISOString();
     const busyAccount = createMockAccount({
-      closedPositions: Array(10).fill({ realizedPnL: 100, symbol: 'INFY' }),
+      closedPositions: Array(10).fill({ realizedPnL: 100, symbol: 'INFY', exitTime }),
     });
     const decision = createBuyDecision();
 
@@ -390,11 +391,12 @@ describe('AI Intraday Integration (20 Scenarios)', () => {
 
   // ── Scenario 15: Max Consecutive Losses Limit ───────────────────
   it('15. RiskEngine halts trading after 3 consecutive losses', () => {
+    const exitTime = new Date().toISOString();
     const losingStreak = createMockAccount({
       closedPositions: [
-        { realizedPnL: -200, symbol: 'TCS' },
-        { realizedPnL: -350, symbol: 'TCS' },
-        { realizedPnL: -180, symbol: 'TCS' },
+        { realizedPnL: -200, symbol: 'TCS', exitTime },
+        { realizedPnL: -350, symbol: 'TCS', exitTime },
+        { realizedPnL: -180, symbol: 'TCS', exitTime },
       ],
     });
     const decision = createBuyDecision();

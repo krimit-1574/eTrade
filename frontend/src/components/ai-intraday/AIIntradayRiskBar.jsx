@@ -7,22 +7,27 @@ export default function AIIntradayRiskBar({
   calculatedSizing, 
   onOpenSettings 
 }) {
-  const capital = account?.accountValue || riskSettings?.paperCapital || 100000;
-  const availableCash = account?.availableCash ?? capital;
-  const usedCapital = account?.usedCapital || 0;
-  const dailyPnL = account?.dailyPnL || 0;
-  const maxDailyLoss = riskSettings?.maxDailyLoss || 3000;
+  const finiteOr = (value, fallback = 0) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  };
+  const capital = Math.max(0, finiteOr(account?.accountValue ?? riskSettings?.paperCapital, 100000));
+  const usedCapital = Math.max(0, finiteOr(account?.usedCapital));
+  const dailyPnL = finiteOr(account?.dailyPnL);
+  const unrealizedPnL = finiteOr(account?.unrealizedPnL);
+  const maxDailyLoss = Math.max(0, finiteOr(riskSettings?.maxDailyLoss, 3000));
 
   // Remaining daily loss budget before circuit breaker trips
-  const remainingDailyLoss = Math.max(0, maxDailyLoss + dailyPnL);
-  const dailyLossPctUsed = Math.min(100, Math.max(0, (-dailyPnL / maxDailyLoss) * 100));
-
+  const remainingDailyLoss = Math.max(0, maxDailyLoss + dailyPnL + unrealizedPnL);
   // Account Exposure %
   const exposurePct = capital > 0 ? ((usedCapital / capital) * 100).toFixed(1) : '0.0';
 
   // Planned Risk Amount
-  const riskAmount = calculatedSizing?.riskAmount || (capital * ((riskSettings?.maxRiskPerTradePct || 1.0) / 100));
-  const plannedQty = calculatedSizing?.quantity || (account?.activePosition ? account.activePosition.quantity : 0);
+  const riskPct = finiteOr(riskSettings?.maxRiskPerTradePct, 1.0);
+  const riskAmount = finiteOr(calculatedSizing?.riskAmount, capital * (riskPct / 100));
+  // A shared account's first position may belong to another stock workspace.
+  // Only show sizing calculated for the current signal.
+  const plannedQty = Math.max(0, finiteOr(calculatedSizing?.quantity));
 
   const isDailyLimitNear = remainingDailyLoss < (maxDailyLoss * 0.3);
 
@@ -85,7 +90,7 @@ export default function AIIntradayRiskBar({
           <div className="risk-metric">
             <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)', display: 'block' }}>Risk / Trade</span>
             <span style={{ fontSize: '0.88rem', fontWeight: '800', color: 'var(--text-primary)' }}>
-              {riskSettings?.maxRiskPerTradePct || 1.0}% <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary)' }}>(₹{Math.round(riskAmount).toLocaleString('en-IN')})</span>
+              {riskPct}% <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary)' }}>(₹{Math.round(riskAmount).toLocaleString('en-IN')})</span>
             </span>
           </div>
 

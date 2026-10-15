@@ -3,10 +3,10 @@ import { X, ShieldAlert, RotateCcw, Check, Info } from 'lucide-react';
 import { DEFAULT_RISK_SETTINGS } from '../../services/TechnicalAnalysis/RiskEngine';
 
 export default function AIIntradayRiskSettingsModal({ isOpen, onClose, currentSettings, onSave, onReset }) {
-  if (!isOpen) return null;
-
   const [form, setForm] = useState({ ...DEFAULT_RISK_SETTINGS, ...currentSettings });
   const [savedNotice, setSavedNotice] = useState(false);
+
+  if (!isOpen) return null;
 
   const handleChange = (field, value) => {
     setForm(prev => ({

@@ -24,6 +24,11 @@ export const POSITION_DECISION = {
   MOVE_STOP: 'MOVE_STOP',
 };
 
+function finiteNumber(value) {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export const PositionManager = {
 
   /**
@@ -40,7 +45,8 @@ export const PositionManager = {
     riskSettings,
     currentTime,
   }) {
-    if (!position || !currentPrice || currentPrice <= 0) {
+    const price = finiteNumber(currentPrice);
+    if (!position || price === null || price <= 0) {
       return { action: POSITION_DECISION.HOLD, reason: 'No active position or invalid price' };
     }
 
@@ -56,16 +62,32 @@ export const PositionManager = {
       initialStopLoss = stopLoss,
     } = position;
 
-    const high = candleHigh ?? currentPrice;
-    const low = candleLow ?? currentPrice;
+    const entry = finiteNumber(entryPrice);
+    const stop = finiteNumber(stopLoss);
+    const initialStop = finiteNumber(initialStopLoss);
+    const openQuantity = finiteNumber(quantity);
+    const firstTarget = finiteNumber(target1);
+    const secondTarget = finiteNumber(target2);
+    const high = finiteNumber(candleHigh ?? price);
+    const low = finiteNumber(candleLow ?? price);
 
-    // 1. Calculate R-Multiple: Profit expressed in initial risk units
-    const initialRiskDistance = Math.abs(entryPrice - (initialStopLoss || stopLoss));
-    const priceDiff = direction === 'LONG' ? (currentPrice - entryPrice) : (entryPrice - currentPrice);
-    const rMultiple = initialRiskDistance > 0 ? parseFloat((priceDiff / initialRiskDistance).toFixed(2)) : 0;
-
-    // 2. Intraday Cutoff Time Guard (15:15 IST) - uses shared RiskEngine policy
-    if (RiskEngine.shouldEnforceCutoffExit({ settings: riskSettings, currentTime })) {
+    // A mandatory intraday square-off is an emergency lifecycle rule. Evaluate
+    // it before position risk fields so a corrupt/missing stop or target cannot
+    // leave an overnight position alive indefinitely.
+    const initialRiskDistance = entry !== null && initialStop !== null
+      ? Math.abs(entry - initialStop)
+      : 0;
+    const priceDiff = entry !== null && (direction === 'LONG' || direction === 'SHORT')
+      ? (direction === 'LONG' ? (price - entry) : (entry - price))
+      : 0;
+    const rMultiple = initialRiskDistance > 0
+      ? parseFloat((priceDiff / initialRiskDistance).toFixed(2))
+      : 0;
+    if (RiskEngine.shouldEnforceCutoffExit({
+      settings: riskSettings,
+      currentTime,
+      positionEntryTime: position.entryTime,
+    })) {
       return {
         action: POSITION_DECISION.EXIT,
         reason: `Intraday cutoff reached (${riskSettings?.intradayCutoffTime || '15:15'} IST). Square-off enforced.`,
@@ -74,42 +96,58 @@ export const PositionManager = {
       };
     }
 
-    // 3. Stop-Loss Breach Check
-    if (direction === 'LONG' && low <= stopLoss) {
+    if (
+      entry === null || entry <= 0
+      || stop === null || stop <= 0
+      || initialStop === null || initialStop <= 0
+      || openQuantity === null || !Number.isInteger(openQuantity) || openQuantity <= 0
+      || (direction !== 'LONG' && direction !== 'SHORT')
+      || (direction === 'LONG' && initialStop >= entry)
+      || (direction === 'SHORT' && initialStop <= entry)
+      || high === null || low === null || high < low
+    ) {
+      return { action: POSITION_DECISION.HOLD, reason: 'Position contains invalid risk or market data' };
+    }
+
+    // 1. Calculate R-Multiple: Profit expressed in initial risk units
+    // 2. Stop-Loss Breach Check
+    if (direction === 'LONG' && low <= stop) {
       return {
         action: POSITION_DECISION.EXIT,
         reason: 'Stop Loss Hit',
-        exitPrice: stopLoss,
+        exitPrice: stop,
         markerType: 'STOP',
         rMultiple,
       };
     }
-    if (direction === 'SHORT' && high >= stopLoss) {
+    if (direction === 'SHORT' && high >= stop) {
       return {
         action: POSITION_DECISION.EXIT,
         reason: 'Stop Loss Hit',
-        exitPrice: stopLoss,
+        exitPrice: stop,
         markerType: 'STOP',
         rMultiple,
       };
     }
 
     // 4. Target 2 Reached: Final Profit Taking
-    if (target2) {
-      if (direction === 'LONG' && high >= target2) {
+    const hasValidSecondTarget = secondTarget !== null && secondTarget > 0
+      && (direction === 'LONG' ? secondTarget > entry : secondTarget < entry);
+    if (hasValidSecondTarget) {
+      if (direction === 'LONG' && high >= secondTarget) {
         return {
           action: POSITION_DECISION.TAKE_PROFIT,
-          reason: `Target 2 Reached @ ₹${target2}. Full profit taken.`,
-          exitPrice: target2,
+          reason: `Target 2 Reached @ ₹${secondTarget}. Full profit taken.`,
+          exitPrice: secondTarget,
           markerType: 'TARGET',
           rMultiple,
         };
       }
-      if (direction === 'SHORT' && low <= target2) {
+      if (direction === 'SHORT' && low <= secondTarget) {
         return {
           action: POSITION_DECISION.TAKE_PROFIT,
-          reason: `Target 2 Reached @ ₹${target2}. Full profit taken.`,
-          exitPrice: target2,
+          reason: `Target 2 Reached @ ₹${secondTarget}. Full profit taken.`,
+          exitPrice: secondTarget,
           markerType: 'TARGET',
           rMultiple,
         };
@@ -118,14 +156,16 @@ export const PositionManager = {
 
     // 5. Target 1 Reached: Partial Exit (50% scale-out)
     const hasTakenPartial = partialExits.length > 0;
-    if (target1 && !hasTakenPartial && quantity > 1) {
-      if ((direction === 'LONG' && high >= target1) || (direction === 'SHORT' && low <= target1)) {
-        const exitQty = Math.ceil(quantity / 2);
+    const hasValidFirstTarget = firstTarget !== null && firstTarget > 0
+      && (direction === 'LONG' ? firstTarget > entry : firstTarget < entry);
+    if (hasValidFirstTarget && !hasTakenPartial && openQuantity > 1) {
+      if ((direction === 'LONG' && high >= firstTarget) || (direction === 'SHORT' && low <= firstTarget)) {
+        const exitQty = Math.floor(openQuantity / 2);
         return {
           action: POSITION_DECISION.PARTIAL_EXIT,
-          reason: `Target 1 Reached @ ₹${target1}. 50% scale-out.`,
+          reason: `Target 1 Reached @ ₹${firstTarget}. 50% scale-out.`,
           exitQuantity: exitQty,
-          exitPrice: target1,
+          exitPrice: firstTarget,
           markerType: 'PARTIAL EXIT',
           rMultiple,
         };
@@ -138,10 +178,10 @@ export const PositionManager = {
       if (shouldMoveToBE) {
         // Break-even stop is entry price plus small buffer to cover commission
         const beStop = direction === 'LONG' 
-          ? parseFloat((entryPrice * 1.0005).toFixed(2)) 
-          : parseFloat((entryPrice * 0.9995).toFixed(2));
+          ? parseFloat((entry * 1.0005).toFixed(2))
+          : parseFloat((entry * 0.9995).toFixed(2));
 
-        const isNarrowing = direction === 'LONG' ? beStop > stopLoss : beStop < stopLoss;
+        const isNarrowing = direction === 'LONG' ? beStop > stop : beStop < stop;
         if (isNarrowing) {
           return {
             action: POSITION_DECISION.MOVE_TO_BREAKEVEN,
@@ -155,13 +195,14 @@ export const PositionManager = {
 
     // 7. Trailing Stop Logic (Active after Break-Even or Partial Exit)
     if (breakevenMoved || hasTakenPartial || rMultiple >= 1.0) {
-      const atr = technicalAnalysis?.indicators?.atr || (entryPrice * 0.008);
+      const parsedAtr = finiteNumber(technicalAnalysis?.atr ?? technicalAnalysis?.indicators?.atr);
+      const atr = parsedAtr !== null && parsedAtr > 0 ? parsedAtr : (entry * 0.008);
       const trailDistance = atr * 1.5;
 
       if (direction === 'LONG') {
-        const candidateStop = parseFloat((currentPrice - trailDistance).toFixed(2));
+        const candidateStop = parseFloat((price - trailDistance).toFixed(2));
         // Rule 8: Only ratchet HIGHER, never widen
-        if (candidateStop > stopLoss && candidateStop > entryPrice) {
+        if (candidateStop > stop && candidateStop > entry) {
           return {
             action: POSITION_DECISION.TRAIL_STOP,
             reason: `Trailing stop ratcheted higher to ₹${candidateStop} (1.5× ATR).`,
@@ -170,9 +211,9 @@ export const PositionManager = {
           };
         }
       } else {
-        const candidateStop = parseFloat((currentPrice + trailDistance).toFixed(2));
+        const candidateStop = parseFloat((price + trailDistance).toFixed(2));
         // Rule 8: Only ratchet LOWER, never widen
-        if (candidateStop < stopLoss && candidateStop < entryPrice) {
+        if (candidateStop < stop && candidateStop < entry) {
           return {
             action: POSITION_DECISION.TRAIL_STOP,
             reason: `Trailing stop ratcheted lower to ₹${candidateStop} (1.5× ATR).`,

@@ -212,7 +212,9 @@ export default function TradeDetailsModal({ isOpen, onClose, trade, candles = []
       } else if (typeof createSeriesMarkers === 'function') {
         try {
           createSeriesMarkers(candleSeries, markers);
-        } catch (_) {}
+        } catch {
+          // Marker support varies across lightweight-charts versions.
+        }
       }
     }
 

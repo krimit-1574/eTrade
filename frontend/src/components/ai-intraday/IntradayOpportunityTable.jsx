@@ -6,7 +6,6 @@ export default function IntradayOpportunityTable({
   opportunities = [],
   isLoading = false,
   lastAnalysed = '',
-  marketStatus = 'OPEN',
   dataSource = '',
   isFallback = false,
   error = null,

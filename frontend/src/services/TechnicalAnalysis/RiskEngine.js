@@ -10,6 +10,7 @@
  */
 
 const STORAGE_KEY = 'etrade_risk_settings';
+const USER_STORAGE_KEY = 'eTA_user';
 
 export const DEFAULT_RISK_SETTINGS = {
   // Capital & Exposure
@@ -63,6 +64,28 @@ function normalizeSymbol(symbol) {
   return typeof symbol === 'string'
     ? symbol.trim().toUpperCase().replace(/\.NS$/i, '')
     : '';
+}
+
+function currentOwnerId() {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const rawUser = localStorage.getItem(USER_STORAGE_KEY);
+      if (rawUser) {
+        const user = JSON.parse(rawUser);
+        const identifier = user?.user_id ?? user?.id ?? user?.username;
+        if (identifier !== undefined && identifier !== null && String(identifier).trim()) {
+          return String(identifier).trim();
+        }
+      }
+    }
+  } catch (error) {
+    console.warn('RiskEngine: Failed to determine settings owner', error);
+  }
+  return 'guest';
+}
+
+function settingsStorageKey() {
+  return `${STORAGE_KEY}:${encodeURIComponent(currentOwnerId())}`;
 }
 
 function normalizeRiskSettings(settings = {}) {
@@ -122,7 +145,9 @@ function getIstParts(value = null) {
 
 function isTradeFromDate(record, dateKey) {
   const timestamp = record?.exitTime || record?.entryTime || record?.filledAt || record?.createdAt;
-  if (!timestamp) return true; // Preserve legacy/session-only records that predate timestamps.
+  // Undated legacy rows cannot safely be charged against every future trading
+  // day. They remain in history but are excluded from date-scoped limits.
+  if (!timestamp) return false;
   return getIstParts(timestamp)?.dateKey === dateKey;
 }
 
@@ -132,7 +157,7 @@ export const RiskEngine = {
    */
   loadSettings() {
     try {
-      const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null;
+      const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(settingsStorageKey()) : null;
       if (stored) {
         return normalizeRiskSettings(JSON.parse(stored));
       }
@@ -149,7 +174,7 @@ export const RiskEngine = {
     const merged = normalizeRiskSettings(settings);
     try {
       if (typeof localStorage !== 'undefined') {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+        localStorage.setItem(settingsStorageKey(), JSON.stringify(merged));
       }
       return merged;
     } catch (e) {
@@ -163,8 +188,10 @@ export const RiskEngine = {
    */
   resetSettings() {
     try {
-      if (typeof localStorage !== 'undefined') localStorage.removeItem(STORAGE_KEY);
-    } catch (_) {}
+      if (typeof localStorage !== 'undefined') localStorage.removeItem(settingsStorageKey());
+    } catch (error) {
+      console.warn('RiskEngine: Failed to reset settings', error);
+    }
     return normalizeRiskSettings();
   },
 
@@ -401,13 +428,16 @@ export const RiskEngine = {
    * Policy: Determines whether intraday cutoff square-off exit should be enforced.
    * Returns true if square-off should be triggered, false if bypassed or before cutoff.
    */
-  shouldEnforceCutoffExit({ settings = {}, marketState = null, currentTime = null }) {
+  shouldEnforceCutoffExit({ settings = {}, marketState = null, currentTime = null, positionEntryTime = null }) {
     if (this.shouldBypassCutoff(settings, marketState)) {
       return false;
     }
 
     const ist = getIstParts(currentTime);
     if (!ist) return true;
+    if (ist.day === 0 || ist.day === 6) return true;
+    const entryDate = positionEntryTime ? getIstParts(positionEntryTime)?.dateKey : null;
+    if (entryDate && entryDate !== ist.dateKey) return true;
     const cutoffMinutes = parseClockMinutes(settings?.intradayCutoffTime, '15:15');
     return ist.minutes >= cutoffMinutes;
   },
@@ -429,6 +459,9 @@ export const RiskEngine = {
     }
     if (!account || typeof account !== 'object') {
       return { approved: false, code: REJECTION_CODES.INSUFFICIENT_CAPITAL, reason: 'Paper account state is unavailable.' };
+    }
+    if (stockInfo?.isStaleData === true || marketState?.isStaleData === true || marketState?.stale === true) {
+      return { approved: false, code: REJECTION_CODES.STALE_DATA, reason: 'Market data is stale or disconnected.' };
     }
 
     const entry = asFiniteNumber(decision.entry);
@@ -468,7 +501,8 @@ export const RiskEngine = {
 
     // 3. Daily Loss Limit Check. Include live losses so a losing open book cannot
     // keep adding risk until those positions happen to close.
-    const realizedDaily = asFiniteNumber(account.dailyPnL) ?? 0;
+    const accountDateIsCurrent = !account.tradingDate || !nowParts?.dateKey || account.tradingDate === nowParts.dateKey;
+    const realizedDaily = accountDateIsCurrent ? (asFiniteNumber(account.dailyPnL) ?? 0) : 0;
     const unrealizedDaily = asFiniteNumber(account.unrealizedPnL) ?? 0;
     const netDailyPnL = realizedDaily + unrealizedDaily;
     if (netDailyPnL < 0 && netDailyPnL <= -settings.maxDailyLoss) {
@@ -583,14 +617,19 @@ export const RiskEngine = {
       (expectedDirection === 'LONG' ? target1 > entry : target1 < entry);
     const targetDistance = targetIsValid ? Math.abs(target1 - entry) : 0;
     const stopDistance = Math.abs(entry - stopLoss);
-    const calculatedRR = stopDistance > 0 ? parseFloat((targetDistance / stopDistance).toFixed(2)) : 0;
+    const calculatedRR = stopDistance > 0 ? targetDistance / stopDistance : 0;
     const reportedRR = asFiniteNumber(decision.riskReward);
     // Never trust an AI-reported ratio that is more optimistic than its actual levels.
-    const tradeRR = reportedRR !== null && reportedRR >= 0
+    const rawTradeRR = reportedRR !== null && reportedRR >= 0
       ? Math.min(reportedRR, calculatedRR)
       : calculatedRR;
+    const tradeRR = parseFloat(rawTradeRR.toFixed(2));
 
-    if (tradeRR < settings.minRiskReward) {
+    // Prices are stored to paise precision, so an exact 1.50 setup can be
+    // represented as 1.499999999999995 in binary floating point. Keep the
+    // comparison strict for materially sub-threshold trades while tolerating
+    // only machine-level rounding noise.
+    if (rawTradeRR + Number.EPSILON * 100 < settings.minRiskReward) {
       return { 
         approved: false, 
         code: REJECTION_CODES.POOR_RISK_REWARD, 
@@ -602,9 +641,14 @@ export const RiskEngine = {
     // and take the larger stored value so stale bookkeeping cannot loosen the cap.
     const positionsExposure = activeList.reduce((sum, position) => {
       const positionEntry = asFiniteNumber(position.entryPrice);
+      const positionMarketPrice = asFiniteNumber(position.currentPrice);
       const positionQuantity = asFiniteNumber(position.quantity);
-      return positionEntry !== null && positionEntry > 0 && positionQuantity !== null && positionQuantity > 0
-        ? sum + positionEntry * positionQuantity
+      const exposurePrice = Math.max(
+        positionEntry !== null && positionEntry > 0 ? positionEntry : 0,
+        positionMarketPrice !== null && positionMarketPrice > 0 ? positionMarketPrice : 0,
+      );
+      return exposurePrice > 0 && positionQuantity !== null && positionQuantity > 0
+        ? sum + exposurePrice * positionQuantity
         : sum;
     }, 0);
     const storedExposure = asFiniteNumber(account.usedCapital);

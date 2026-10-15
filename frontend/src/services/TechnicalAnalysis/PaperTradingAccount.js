@@ -39,6 +39,15 @@ function currentTradingDate() {
   return `${ist.getUTCFullYear()}-${String(ist.getUTCMonth() + 1).padStart(2, '0')}-${String(ist.getUTCDate()).padStart(2, '0')}`;
 }
 
+function rolloverDailyState(account) {
+  const today = currentTradingDate();
+  if (account.tradingDate !== today) {
+    account.dailyPnL = 0;
+    account.tradingDate = today;
+  }
+  return account;
+}
+
 function currentOwnerId() {
   try {
     if (typeof localStorage !== 'undefined') {
@@ -51,7 +60,9 @@ function currentOwnerId() {
         }
       }
     }
-  } catch (_) {}
+  } catch {
+    // Invalid persisted user data falls back to the guest account.
+  }
   return 'guest';
 }
 
@@ -97,10 +108,7 @@ function hydrateAccount(parsed, config, ownerId) {
   account.unrealizedPnL = finiteNumber(account.unrealizedPnL, 0);
   account.dailyPnL = finiteNumber(account.dailyPnL, 0);
   account.tradingDate = account.tradingDate || currentTradingDate();
-  if (account.tradingDate !== currentTradingDate()) {
-    account.dailyPnL = 0;
-    account.tradingDate = currentTradingDate();
-  }
+  rolloverDailyState(account);
   return recalculateAccount(account);
 }
 
@@ -174,7 +182,8 @@ export const PaperTradingAccount = {
       }
       account.ownerId = ownerId;
       account.tradingDate = account.tradingDate || currentTradingDate();
-      normalizePositionCollections(account);
+      rolloverDailyState(account);
+      recalculateAccount(account);
       if (typeof sessionStorage !== 'undefined') {
         sessionStorage.setItem(storageKeyFor(ownerId), JSON.stringify(account));
       }
@@ -205,6 +214,10 @@ export const PaperTradingAccount = {
     let position = null;
     let currentPrice = null;
     if (typeof symbolOrPrice === 'number') {
+      // The legacy two-argument form is only unambiguous for a single-stock
+      // account. Refuse to mark an arbitrary first position in a multi-stock
+      // book; callers must provide the symbol explicitly.
+      if (account.activePositions.length > 1) return account;
       position = account.activePositions[0] || null;
       currentPrice = finiteNumber(symbolOrPrice, null);
     } else if (typeof symbolOrPrice === 'string') {
@@ -230,6 +243,16 @@ export const PaperTradingAccount = {
     recalculateAccount(account);
     this.save(account);
     return account;
+  },
+
+  /**
+   * Rolls daily controls at the IST trading-date boundary before any risk
+   * validation or accounting mutation occurs.
+   */
+  rolloverDaily(account) {
+    if (!account || typeof account !== 'object') return account;
+    account.tradingDate = account.tradingDate || currentTradingDate();
+    return rolloverDailyState(account);
   },
 
   DEFAULT_CONFIG,

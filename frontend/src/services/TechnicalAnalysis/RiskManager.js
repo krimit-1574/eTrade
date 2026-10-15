@@ -5,36 +5,44 @@
 
 import { StrategyConfig } from './StrategyConfig';
 
+function positiveNumber(value) {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 export const RiskManager = {
   
   /**
    * Calculates long trade risk parameters.
    */
   calculateLongRisk(entry, atr, support) {
-    if (!entry) return null;
+    const safeEntry = positiveNumber(entry);
+    if (safeEntry === null) return null;
+    const safeAtr = positiveNumber(atr) ?? (safeEntry * 0.008);
+    const safeSupport = positiveNumber(support);
     
     // Default SL based on ATR
-    let stopLoss = entry - (atr * StrategyConfig.ATR_STOP_MULTIPLIER);
+    let stopLoss = safeEntry - (safeAtr * StrategyConfig.ATR_STOP_MULTIPLIER);
     
     // If a recent support level exists and is close enough, use it instead (slightly below it)
-    if (support && support < entry && entry - support < (entry * StrategyConfig.MAX_STOP_PCT)) {
+    if (safeSupport !== null && safeSupport < safeEntry && safeEntry - safeSupport < (safeEntry * StrategyConfig.MAX_STOP_PCT)) {
       // Use whichever is wider (safer) to avoid being stopped out by noise, 
       // but cap it at the max allowed stop distance.
-      const supportSL = support * 0.998; // 0.2% below support
+      const supportSL = safeSupport * 0.998; // 0.2% below support
       stopLoss = Math.min(stopLoss, supportSL);
     }
     
     // Check max stop limit
-    if ((entry - stopLoss) / entry > StrategyConfig.MAX_STOP_PCT) {
-      stopLoss = entry * (1 - StrategyConfig.MAX_STOP_PCT);
+    if ((safeEntry - stopLoss) / safeEntry > StrategyConfig.MAX_STOP_PCT) {
+      stopLoss = safeEntry * (1 - StrategyConfig.MAX_STOP_PCT);
     }
     
-    const risk = entry - stopLoss;
-    const target1 = entry + (risk * StrategyConfig.TARGET_1_MULTIPLIER);
-    const target2 = entry + (risk * StrategyConfig.TARGET_2_MULTIPLIER);
+    const risk = safeEntry - stopLoss;
+    const target1 = safeEntry + (risk * StrategyConfig.TARGET_1_MULTIPLIER);
+    const target2 = safeEntry + (risk * StrategyConfig.TARGET_2_MULTIPLIER);
     
     return {
-      entry: parseFloat(entry.toFixed(2)),
+      entry: parseFloat(safeEntry.toFixed(2)),
       stopLoss: parseFloat(stopLoss.toFixed(2)),
       target1: parseFloat(target1.toFixed(2)),
       target2: parseFloat(target2.toFixed(2)),
@@ -46,25 +54,29 @@ export const RiskManager = {
    * Calculates short trade risk parameters.
    */
   calculateShortRisk(entry, atr, resistance) {
-    if (!entry) return null;
+    const safeEntry = positiveNumber(entry);
+    if (safeEntry === null) return null;
+    const safeAtr = positiveNumber(atr) ?? (safeEntry * 0.008);
+    const safeResistance = positiveNumber(resistance);
     
-    let stopLoss = entry + (atr * StrategyConfig.ATR_STOP_MULTIPLIER);
+    let stopLoss = safeEntry + (safeAtr * StrategyConfig.ATR_STOP_MULTIPLIER);
     
-    if (resistance && resistance > entry && resistance - entry < (entry * StrategyConfig.MAX_STOP_PCT)) {
-      const resistanceSL = resistance * 1.002; // 0.2% above resistance
+    if (safeResistance !== null && safeResistance > safeEntry && safeResistance - safeEntry < (safeEntry * StrategyConfig.MAX_STOP_PCT)) {
+      const resistanceSL = safeResistance * 1.002; // 0.2% above resistance
       stopLoss = Math.max(stopLoss, resistanceSL);
     }
     
-    if ((stopLoss - entry) / entry > StrategyConfig.MAX_STOP_PCT) {
-      stopLoss = entry * (1 + StrategyConfig.MAX_STOP_PCT);
+    if ((stopLoss - safeEntry) / safeEntry > StrategyConfig.MAX_STOP_PCT) {
+      stopLoss = safeEntry * (1 + StrategyConfig.MAX_STOP_PCT);
     }
     
-    const risk = stopLoss - entry;
-    const target1 = entry - (risk * StrategyConfig.TARGET_1_MULTIPLIER);
-    const target2 = entry - (risk * StrategyConfig.TARGET_2_MULTIPLIER);
+    const risk = stopLoss - safeEntry;
+    const target1 = safeEntry - (risk * StrategyConfig.TARGET_1_MULTIPLIER);
+    const target2 = safeEntry - (risk * StrategyConfig.TARGET_2_MULTIPLIER);
+    if (target2 <= 0) return null;
     
     return {
-      entry: parseFloat(entry.toFixed(2)),
+      entry: parseFloat(safeEntry.toFixed(2)),
       stopLoss: parseFloat(stopLoss.toFixed(2)),
       target1: parseFloat(target1.toFixed(2)),
       target2: parseFloat(target2.toFixed(2)),
