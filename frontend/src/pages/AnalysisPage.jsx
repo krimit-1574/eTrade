@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Search, Download, TrendingUp, TrendingDown, AlertTriangle, Shield, Target, Clock, Zap, CheckCircle2, XCircle, Sparkles, Activity, Star, ShoppingCart } from 'lucide-react';
 import { api } from '../api';
@@ -11,6 +11,7 @@ const fadeUp = {
   animate: { opacity: 1, y: 0 },
   transition: { duration: 0.35 },
 };
+const Motion = motion;
 
 export default function AnalysisPage({ user, initialQuery = '', onTrade }) {
   const [query, setQuery] = useState(initialQuery);
@@ -43,7 +44,7 @@ export default function AnalysisPage({ user, initialQuery = '', onTrade }) {
     return () => clearTimeout(timer);
   }, [query]);
 
-  const handleAnalyze = async (queryToAnalyze = query) => {
+  const handleAnalyze = useCallback(async (queryToAnalyze = query) => {
     if (!queryToAnalyze.trim()) return;
     setShowDropdown(false);
     setError('');
@@ -72,7 +73,7 @@ export default function AnalysisPage({ user, initialQuery = '', onTrade }) {
     } finally {
       setLoading(false);
     }
-  };
+  }, [chartPeriod, query, user.user_id]);
 
   const handleToggleFav = async () => {
     if (!data?.symbol) return;
@@ -88,7 +89,7 @@ export default function AnalysisPage({ user, initialQuery = '', onTrade }) {
       setQuery(initialQuery);
       handleAnalyze(initialQuery);
     }
-  }, [initialQuery, hasAutoAnalyzed]);
+  }, [initialQuery, hasAutoAnalyzed, handleAnalyze]);
 
   const handleChartPeriod = async (period) => {
     setChartPeriod(period);
@@ -194,7 +195,7 @@ export default function AnalysisPage({ user, initialQuery = '', onTrade }) {
 
       {data && (
         <AnimatePresence>
-          <motion.div {...fadeUp}>
+          <Motion.div {...fadeUp}>
             {/* Header / Price Display */}
             <div>
               <div className="flex-row gap-8 mb-16" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
@@ -314,11 +315,11 @@ export default function AnalysisPage({ user, initialQuery = '', onTrade }) {
 
             {/* Candlestick Chart Window */}
             {chartData.length > 0 && (
-              <motion.div className="mt-24" style={{ position: 'relative' }} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }}>
+              <Motion.div className="mt-24" style={{ position: 'relative' }} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }}>
                 
                 {/* Floating Glass Score Overlay */}
                 <div style={{ position: 'absolute', top: '20px', left: '20px', zIndex: 10, display: 'flex', gap: '12px' }}>
-                  <motion.div 
+                  <Motion.div
                     initial={{ x: -20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 0.4 }}
                     className="card" style={{ padding: '12px 16px', background: 'rgba(10,10,15,0.75)', backdropFilter: 'blur(10px)', borderLeft: `4px solid ${scoreColor}`, display: 'flex', alignItems: 'center', gap: '12px' }}>
                     <div className="score-circle" style={{ '--score': score, width: '54px', height: '54px' }}>
@@ -328,10 +329,10 @@ export default function AnalysisPage({ user, initialQuery = '', onTrade }) {
                       <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>AI Fundamental</div>
                       <div style={{ fontSize: '0.9rem', fontWeight: 700, color: scoreColor }}>Quality Score</div>
                     </div>
-                  </motion.div>
+                  </Motion.div>
 
                   {quantAnalysis && !quantAnalysis.error && (
-                    <motion.div 
+                    <Motion.div
                       initial={{ x: -20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ delay: 0.5 }}
                       className="card" style={{ padding: '12px 16px', background: 'rgba(10,10,15,0.75)', backdropFilter: 'blur(10px)', borderLeft: `4px solid ${quantScoreColor}`, display: 'flex', alignItems: 'center', gap: '12px' }}>
                       <div className="score-circle" style={{ '--score': quantScoreNum, width: '54px', height: '54px' }}>
@@ -341,7 +342,7 @@ export default function AnalysisPage({ user, initialQuery = '', onTrade }) {
                         <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Quant Technical</div>
                         <div style={{ fontSize: '0.9rem', fontWeight: 700, color: quantScoreColor }}>Trend Score</div>
                       </div>
-                    </motion.div>
+                    </Motion.div>
                   )}
                 </div>
 
@@ -441,7 +442,7 @@ export default function AnalysisPage({ user, initialQuery = '', onTrade }) {
                     </div>
                   )}
                 </div>
-              </motion.div>
+              </Motion.div>
             )}
 
             {/* Detailed Analysis Tabs */}
@@ -455,7 +456,7 @@ export default function AnalysisPage({ user, initialQuery = '', onTrade }) {
 
             {/* Tab Content */}
             <AnimatePresence mode="wait">
-              <motion.div key={activeTab} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }}>
+              <Motion.div key={activeTab} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }}>
                 {activeTab === 0 && <OverviewTab data={data} />}
                 {activeTab === 1 && <AIAdvisorTab data={data} />}
                 {activeTab === 2 && <CaseTab items={data.bullCase} type="bull" />}
@@ -463,7 +464,7 @@ export default function AnalysisPage({ user, initialQuery = '', onTrade }) {
                 {activeTab === 4 && <FinancialsTab data={data.financials} quarterly={data.quarterly} />}
                 {activeTab === 5 && <HoldingsTab data={data} />}
                 {activeTab === 6 && <AdviceTab data={data.advice} />}
-              </motion.div>
+              </Motion.div>
             </AnimatePresence>
 
             {/* Export PDF */}
@@ -472,7 +473,7 @@ export default function AnalysisPage({ user, initialQuery = '', onTrade }) {
                 <Download size={16} /> Export PDF Report
               </button>
             </div>
-          </motion.div>
+          </Motion.div>
         </AnimatePresence>
       )}
     </div>
@@ -606,18 +607,18 @@ function CaseTab({ items, type }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
       {items?.map((item, i) => (
-        <motion.div key={i} className={`card ${accent}`} initial={{ opacity: 0, x: -12 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.1 }}>
+        <Motion.div key={i} className={`card ${accent}`} initial={{ opacity: 0, x: -12 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.1 }}>
           <h4 style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
             <Icon size={18} style={{ color: iconColor }} /> {item.title}
           </h4>
           <p style={{ fontSize: '0.85rem' }}>{item.detail}</p>
-        </motion.div>
+        </Motion.div>
       ))}
     </div>
   );
 }
 
-function FinancialsTab({ data, quarterly }) {
+function FinancialsTab({ data, quarterly: _quarterly }) {
   if (!data) return null;
   const entries = Object.entries(data);
   return (

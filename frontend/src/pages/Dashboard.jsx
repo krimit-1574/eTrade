@@ -134,7 +134,9 @@ export default function Dashboard({ user, onLogout }) {
         </div>
 
         <nav className="sidebar-nav">
-          {NAV_ITEMS.map(({ id, label, icon: Icon }) => {
+          {NAV_ITEMS.map((item) => {
+            const { id, label } = item;
+            const Icon = item.icon;
             const isActive = activePage === id || (id === 'ai-intraday' && activePage.startsWith('ai-intraday/'));
             return (
               <button

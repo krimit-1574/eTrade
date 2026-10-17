@@ -159,7 +159,15 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
           }}
         >
           {displayMarketContext.indices.map((idx) => {
-            const isUp = idx.changePct >= 0;
+            const numericPrice = Number(idx.price);
+            const numericChangePct = Number(idx.changePct);
+            const hasFreshQuote = idx.isStaleData !== true
+              && Number.isFinite(numericPrice)
+              && Number.isFinite(numericChangePct);
+            const isUp = hasFreshQuote && numericChangePct >= 0;
+            const changeColor = !hasFreshQuote
+              ? 'var(--text-muted)'
+              : (isUp ? '#10B981' : '#EF4444');
             return (
               <span
                 key={idx.symbol}
@@ -169,19 +177,19 @@ export default function AIIntradayPage({ user, activeSymbol, onStartAI, onBackTo
                   gap: '6px',
                   padding: '5px 12px',
                   borderRadius: '16px',
-                  background: isUp ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.08)',
-                  border: `1px solid ${isUp ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)'}`,
+                  background: !hasFreshQuote ? 'rgba(255, 255, 255, 0.03)' : (isUp ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.08)'),
+                  border: `1px solid ${!hasFreshQuote ? 'var(--border)' : (isUp ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)')}`,
                   fontSize: '0.78rem',
                   fontWeight: '700',
                 }}
               >
                 <span style={{ color: 'var(--text-secondary)' }}>{idx.name}</span>
                 <span style={{ color: 'var(--text-primary)', fontWeight: '800' }}>
-                  {typeof idx.price === 'number' ? idx.price.toLocaleString('en-IN', { maximumFractionDigits: 0 }) : idx.price}
+                  {hasFreshQuote ? numericPrice.toLocaleString('en-IN', { maximumFractionDigits: 0 }) : '—'}
                 </span>
-                {isUp ? <TrendingUp size={12} color="#10B981" /> : <TrendingDown size={12} color="#EF4444" />}
-                <span style={{ color: isUp ? '#10B981' : '#EF4444', fontWeight: '700' }}>
-                  {isUp ? '+' : ''}{typeof idx.changePct === 'number' ? idx.changePct.toFixed(2) : idx.changePct}%
+                {hasFreshQuote && (isUp ? <TrendingUp size={12} color="#10B981" /> : <TrendingDown size={12} color="#EF4444" />)}
+                <span style={{ color: changeColor, fontWeight: '700' }}>
+                  {hasFreshQuote ? `${isUp ? '+' : ''}${numericChangePct.toFixed(2)}%` : 'Unavailable'}
                 </span>
               </span>
             );

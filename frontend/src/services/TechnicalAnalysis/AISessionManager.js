@@ -52,6 +52,16 @@ const TIMEFRAME_CONFIG = {
 };
 
 const MAX_QUOTE_AGE_MS = 30_000;
+const MAX_PROVIDER_QUOTE_AGE_MS = 90_000;
+const MAX_QUOTE_FUTURE_SKEW_MS = 30_000;
+const MAX_CANDLE_FUTURE_SKEW_MS = 2 * 60_000;
+const MAX_CANDLE_AGE_MS = {
+  '1m': 8 * 60_000,
+  '3m': 10 * 60_000,
+  '5m': 12 * 60_000,
+  '15m': 22 * 60_000,
+  '30m': 38 * 60_000,
+};
 
 function normalizeSymbol(symbol) {
   return String(symbol || '').trim().toUpperCase().replace(/\.NS$/, '');
@@ -64,6 +74,39 @@ function normalizeUserId(userId) {
 function toFiniteNumber(value, fallback = 0) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+function providerQuoteIsFresh({ asOf, precision, freshnessLimitSeconds } = {}) {
+  if (precision !== 'timestamp' || !asOf) return false;
+  const asOfMs = new Date(asOf).getTime();
+  if (!Number.isFinite(asOfMs)) return false;
+  const advertisedLimit = Number(freshnessLimitSeconds);
+  const providerLimitMs = Number.isFinite(advertisedLimit) && advertisedLimit > 0
+    ? Math.min(MAX_PROVIDER_QUOTE_AGE_MS, advertisedLimit * 1000)
+    : MAX_PROVIDER_QUOTE_AGE_MS;
+  const ageMs = Date.now() - asOfMs;
+  return ageMs >= -MAX_QUOTE_FUTURE_SKEW_MS && ageMs <= providerLimitMs;
+}
+
+function candleTimestampMs(candle) {
+  const rawTimestamp = candle?.time ?? candle?.date;
+  if (typeof rawTimestamp === 'number') {
+    const milliseconds = rawTimestamp > 1_000_000_000_000
+      ? rawTimestamp
+      : rawTimestamp * 1000;
+    return Number.isFinite(milliseconds) ? milliseconds : Number.NaN;
+  }
+  return new Date(rawTimestamp).getTime();
+}
+
+function candlesAreFresh(candles, interval) {
+  if (!Array.isArray(candles) || candles.length === 0) return false;
+  const latestTimestamp = candleTimestampMs(candles[candles.length - 1]);
+  if (!Number.isFinite(latestTimestamp)) return false;
+  const maxAge = MAX_CANDLE_AGE_MS[interval];
+  if (!Number.isFinite(maxAge)) return false;
+  const age = Date.now() - latestTimestamp;
+  return age >= -MAX_CANDLE_FUTURE_SKEW_MS && age <= maxAge;
 }
 
 // ─── Individual Session State ────────────────────────────────────
@@ -95,7 +138,12 @@ function createSessionState(symbol, config = {}) {
     isStaleData: true,
     lastTickTime: null,
     quoteAsOf: null,
+    quoteAsOfPrecision: null,
+    quoteFreshnessLimitSeconds: null,
     quoteProvider: null,
+    dataInterval: null,
+    candleAsOf: null,
+    fallbackReason: null,
 
     // Analysis
     technicalAnalysis: null,
@@ -570,14 +618,25 @@ export class AISessionManagerSingleton {
       if (!this._isCurrentRequest(symbol, session, '_priceRequestId', requestId)) return;
 
       const price = Number(res?.price);
-      const providerReportsDelay = res?.is_delayed === true || res?.isDelayed === true;
-      if (res?.price !== 'N/A' && Number.isFinite(price) && price > 0 && !providerReportsDelay) {
+      const providerReportsFresh = res?.is_delayed === false
+        && res?.isDelayed !== true
+        && providerQuoteIsFresh({
+          asOf: res?.as_of,
+          precision: res?.as_of_precision,
+          freshnessLimitSeconds: res?.freshness_limit_seconds,
+        });
+      if (res?.price !== 'N/A' && Number.isFinite(price) && price > 0 && providerReportsFresh) {
         session.price = price;
         session.change = toFiniteNumber(res.change);
         session.changePct = toFiniteNumber(res.pct ?? res.changePct);
         session._priceStale = false;
         session.lastTickTime = Date.now();
         session.quoteAsOf = res?.as_of || null;
+        session.quoteAsOfPrecision = res?.as_of_precision || null;
+        session.quoteFreshnessLimitSeconds = toFiniteNumber(
+          res?.freshness_limit_seconds,
+          MAX_PROVIDER_QUOTE_AGE_MS / 1000,
+        );
         session.quoteProvider = res?.provider || null;
         this._syncStaleState(session);
 
@@ -615,13 +674,20 @@ export class AISessionManagerSingleton {
       if (!this._isCurrentRequest(symbol, session, '_candleRequestId', requestId)) return;
 
       let candles = Array.isArray(res?.data) ? res.data : [];
-      let usedFallbackTimeframe = false;
+      let dataInterval = String(res?.effectiveInterval || '');
+      let fallbackReason = String(res?.fallbackReason || '');
+      let usedFallbackTimeframe = candles.length > 0 && (
+        res?.isFallback === true
+        || dataInterval !== config.interval
+      );
 
       if (candles.length === 0) {
         // Fallback to longer timeframe
         const fallbackRes = await api.getHistory(session.formattedSymbol, '5d', '15m');
         if (!this._isCurrentRequest(symbol, session, '_candleRequestId', requestId)) return;
         candles = Array.isArray(fallbackRes?.data) ? fallbackRes.data : [];
+        dataInterval = String(fallbackRes?.effectiveInterval || '15m');
+        fallbackReason = String(fallbackRes?.fallbackReason || 'Requested timeframe returned no candles.');
         usedFallbackTimeframe = candles.length > 0;
       }
 
@@ -636,9 +702,20 @@ export class AISessionManagerSingleton {
       }
 
       session.chartData = candles;
-      if (usedFallbackTimeframe) {
+      session.dataInterval = dataInterval;
+      const latestCandleTimestamp = candleTimestampMs(candles[candles.length - 1]);
+      session.candleAsOf = Number.isFinite(latestCandleTimestamp)
+        ? new Date(latestCandleTimestamp).toISOString()
+        : null;
+      session.fallbackReason = fallbackReason || null;
+      const candlesFresh = candlesAreFresh(candles, config.interval);
+      if (usedFallbackTimeframe || !candlesFresh) {
         // A 15-minute fallback can keep the chart informative, but it must not
-        // be traded as though it were the requested timeframe.
+        // be traded as though it were the requested timeframe. Likewise, a
+        // prior-session candle set is display-only even if its interval matches.
+        if (!usedFallbackTimeframe && !candlesFresh) {
+          session.fallbackReason = `Latest ${config.interval} candle is stale or has an invalid timestamp.`;
+        }
         session._candleStale = true;
         this._syncStaleState(session);
         if (session.status !== SESSION_STATUS.POSITION_ACTIVE) {
@@ -816,6 +893,8 @@ export class AISessionManagerSingleton {
           isStaleData: this._isSessionDataStale(session),
           lastTickTime: session.lastTickTime,
           quoteAsOf: session.quoteAsOf,
+          quoteAsOfPrecision: session.quoteAsOfPrecision,
+          quoteFreshnessLimitSeconds: session.quoteFreshnessLimitSeconds,
           quoteProvider: session.quoteProvider,
         },
         customSettings: this.riskSettings,
@@ -865,6 +944,7 @@ export class AISessionManagerSingleton {
           target2: decision.target2,
           setup: decision.setup,
           confidence: decision.confidence,
+          riskReward: validation.riskReward,
           customQuantity: validation.quantity,
           sessionId: session.id,
         }
@@ -966,11 +1046,12 @@ export class AISessionManagerSingleton {
           currentAccount, session.price, evaluation.reason, evaluation.exitQuantity, symbol
         );
         currentAccount = exitResult.account;
-        session.timeline.push(...exitResult.events);
+        session.timeline.push(...(exitResult.events || []));
+        const partialSucceeded = Number(exitResult.partialQty) > 0;
 
-        // Move stop to breakeven
-        const pos = this._getPositionForSymbol(symbol, currentAccount);
-        if (pos) {
+        // Move the stop only after the partial close actually succeeded.
+        const pos = partialSucceeded ? this._getPositionForSymbol(symbol, currentAccount) : null;
+        if (partialSucceeded && pos) {
           const beStop = pos.direction === 'LONG'
             ? parseFloat((pos.entryPrice * 1.0005).toFixed(2))
             : parseFloat((pos.entryPrice * 0.9995).toFixed(2));
@@ -981,7 +1062,13 @@ export class AISessionManagerSingleton {
           }
         }
 
-        if (candleTime) {
+        if (!partialSucceeded) {
+          session.timeline.push(this._timelineEvent(
+            'Partial exit failed',
+            exitResult.reason || 'The paper broker rejected the partial closing order.',
+            'error'
+          ));
+        } else if (candleTime) {
           session.markers.push({
             time: candleTime,
             position: position.direction === 'LONG' ? 'aboveBar' : 'belowBar',
@@ -1008,12 +1095,23 @@ export class AISessionManagerSingleton {
       } else if (evaluation.action === POSITION_DECISION.TAKE_PROFIT || evaluation.action === POSITION_DECISION.EXIT) {
         const exitResult = PaperBroker.closePosition(currentAccount, session.price, evaluation.reason, null, symbol);
         currentAccount = exitResult.account;
-        session.timeline.push(...exitResult.events);
-        session.hasPosition = false;
-        session.positionSummary = null;
-        session.status = SESSION_STATUS.WAITING;
+        session.timeline.push(...(exitResult.events || []));
+        const exitSucceeded = exitResult.closedFully === true
+          && !this._getPositionForSymbol(symbol, currentAccount);
+        if (exitSucceeded) {
+          session.hasPosition = false;
+          session.positionSummary = null;
+          session.status = SESSION_STATUS.WAITING;
+        } else {
+          session.status = SESSION_STATUS.POSITION_ACTIVE;
+          session.timeline.push(this._timelineEvent(
+            'Automatic exit failed',
+            exitResult.reason || 'The paper broker rejected the closing order; position monitoring continues.',
+            'error'
+          ));
+        }
 
-        if (candleTime) {
+        if (exitSucceeded && candleTime) {
           const isTarget = evaluation.markerType === 'TARGET';
           const isStop = evaluation.markerType === 'STOP';
           session.markers.push({
@@ -1114,9 +1212,14 @@ export class AISessionManagerSingleton {
 
   _isSessionDataStale(session) {
     const lastTickTime = Number(session?.lastTickTime);
-    const quoteExpired = !Number.isFinite(lastTickTime)
+    const receiptExpired = !Number.isFinite(lastTickTime)
       || Date.now() - lastTickTime > MAX_QUOTE_AGE_MS;
-    return Boolean(session?._priceStale || session?._candleStale || quoteExpired);
+    const providerQuoteExpired = !providerQuoteIsFresh({
+      asOf: session?.quoteAsOf,
+      precision: session?.quoteAsOfPrecision,
+      freshnessLimitSeconds: session?.quoteFreshnessLimitSeconds,
+    });
+    return Boolean(session?._priceStale || session?._candleStale || receiptExpired || providerQuoteExpired);
   }
 
   _timelineEvent(title, detail, type = 'info') {
@@ -1196,7 +1299,12 @@ export class AISessionManagerSingleton {
           timeframe: session.timeframe,
           lastTickTime: session.lastTickTime,
           quoteAsOf: session.quoteAsOf,
+          quoteAsOfPrecision: session.quoteAsOfPrecision,
+          quoteFreshnessLimitSeconds: session.quoteFreshnessLimitSeconds,
           quoteProvider: session.quoteProvider,
+          dataInterval: session.dataInterval,
+          candleAsOf: session.candleAsOf,
+          fallbackReason: session.fallbackReason,
           decisions: [...session.decisions],
           userId: session.userId,
         }])
@@ -1326,6 +1434,19 @@ export class AISessionManagerSingleton {
    */
   async shutdown({ liquidate = true } = {}) {
     const journals = liquidate ? await this.stopAllSessions() : [];
+    if (liquidate) {
+      const failedSymbols = this.getActiveSessions()
+        .filter(session => this._hasPositionForSymbol(session.symbol))
+        .map(session => session.symbol);
+      if (failedSymbols.length > 0) {
+        const error = new Error(`Could not liquidate open paper positions: ${failedSymbols.join(', ')}`);
+        error.code = 'LIQUIDATION_INCOMPLETE';
+        error.symbols = failedSymbols;
+        // stopSession() has already resumed monitoring for each failed symbol.
+        // Do not destroy those safeguards or discard the owning account state.
+        throw error;
+      }
+    }
     this.destroy();
     return journals;
   }

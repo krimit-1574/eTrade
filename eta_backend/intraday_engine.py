@@ -64,6 +64,7 @@ _scan_cache = {
     "lock": threading.Lock()
 }
 CACHE_DURATION_SEC = 180  # 3 minutes cache
+EXPECTED_NSE_15M_BARS = 25
 
 def is_nse_market_open() -> bool:
     """Check if Indian Stock Market (NSE) is currently open (09:15 - 15:30 IST, Mon-Fri)."""
@@ -77,7 +78,7 @@ def is_nse_market_open() -> bool:
     market_start = ist_now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_end = ist_now.replace(hour=15, minute=30, second=0, microsecond=0)
     
-    return market_start <= ist_now <= market_end
+    return market_start <= ist_now < market_end
 
 def format_volume(vol_num: float) -> str:
     """Format volume numbers nicely (e.g., 8.45M, 350K)."""
@@ -122,22 +123,21 @@ def analyze_single_stock(item: dict) -> dict | None:
         if session_volume <= 0:
             session_volume = float(latest_candle.get("Volume", 0))
 
-        # Previous close
-        if len(df_daily) >= 2:
-            prev_close = float(df_daily.iloc[-2]["Close"])
-        else:
-            prev_close = session_open
+        # Exclude a possibly partial current-day daily candle from both the
+        # previous close and the historical volume baseline.
+        prior_daily = df_daily[df_daily.index.date < last_date] if not df_daily.empty else df_daily
+        prev_close = float(prior_daily.iloc[-1]["Close"]) if not prior_daily.empty else session_open
 
         change = price - prev_close
         change_pct = (change / prev_close * 100) if prev_close > 0 else 0.0
 
-        # Average Volume & RVOL
-        if len(df_daily) >= 5:
-            avg_vol_20d = float(df_daily["Volume"].rolling(20, min_periods=5).mean().iloc[-1])
-        else:
-            avg_vol_20d = session_volume
-
-        rvol = round(session_volume / (avg_vol_20d + 1e-5), 2) if avg_vol_20d > 0 else 1.0
+        # Compare partial-session volume with the expected historical volume
+        # at the same point in the day, not a full-day mean.
+        volume_history = prior_daily["Volume"].tail(20) if not prior_daily.empty else pd.Series(dtype=float)
+        avg_vol_20d = float(volume_history.mean()) if not volume_history.empty else 0.0
+        session_progress = min(1.0, len(df_session) / EXPECTED_NSE_15M_BARS)
+        expected_volume_so_far = avg_vol_20d * session_progress
+        rvol = round(session_volume / expected_volume_so_far, 2) if expected_volume_so_far > 0 else 1.0
 
         # VWAP calculation
         typical_price = (df_session["High"] + df_session["Low"] + df_session["Close"]) / 3

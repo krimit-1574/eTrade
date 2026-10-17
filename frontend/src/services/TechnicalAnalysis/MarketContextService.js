@@ -69,12 +69,72 @@ export const MARKET_REGIMES = {
   RANGE_BOUND: 'RANGE_BOUND',
 };
 
-// Fallback baseline quotes if offline
-const DEFAULT_INDICES = [
-  { symbol: '^NSEI', name: 'NIFTY 50', price: 24850.50, change: 125.40, changePct: 0.51 },
-  { symbol: '^NSEBANK', name: 'BANK NIFTY', price: 51220.80, change: 280.60, changePct: 0.55 },
-  { symbol: '^BSESN', name: 'SENSEX', price: 81560.20, change: 390.10, changePct: 0.48 },
+const INDEX_DEFINITIONS = [
+  { symbol: '^NSEI', name: 'NIFTY 50' },
+  { symbol: '^NSEBANK', name: 'BANK NIFTY' },
+  { symbol: '^BSESN', name: 'SENSEX' },
 ];
+const MAX_BENCHMARK_AGE_MS = 90_000;
+const MAX_FUTURE_SKEW_MS = 30_000;
+
+function unavailableIndex(definition) {
+  return {
+    ...definition,
+    price: 'N/A',
+    change: 'N/A',
+    changePct: 'N/A',
+    isStaleData: true,
+  };
+}
+
+function neutralUnavailableRegime() {
+  return {
+    regime: MARKET_REGIMES.NEUTRAL,
+    label: 'Benchmark Data Unavailable',
+    description: 'Fresh NIFTY and BANK NIFTY quotes are unavailable; benchmark context is excluded from trading signals.',
+    bias: 'NEUTRAL',
+    scoreWeight: 0,
+  };
+}
+
+function parseFreshIndex(result, definition) {
+  if (result?.status !== 'fulfilled' || !result.value || result.value.is_delayed !== false) {
+    return unavailableIndex(definition);
+  }
+
+  const quote = result.value;
+  const quoteTime = quote.as_of_precision === 'timestamp'
+    ? new Date(quote.as_of).getTime()
+    : Number.NaN;
+  const advertisedLimit = Number(quote.freshness_limit_seconds);
+  const freshnessLimit = Number.isFinite(advertisedLimit) && advertisedLimit > 0
+    ? Math.min(MAX_BENCHMARK_AGE_MS, advertisedLimit * 1000)
+    : MAX_BENCHMARK_AGE_MS;
+  const age = Date.now() - quoteTime;
+  const price = Number(quote.price);
+  const change = Number(quote.change);
+  const changePct = Number(quote.pct ?? quote.changePct);
+  if (
+    !Number.isFinite(quoteTime)
+    || age < -MAX_FUTURE_SKEW_MS
+    || age > freshnessLimit
+    || !Number.isFinite(price)
+    || price <= 0
+    || !Number.isFinite(change)
+    || !Number.isFinite(changePct)
+  ) {
+    return unavailableIndex(definition);
+  }
+
+  return {
+    ...definition,
+    price,
+    change,
+    changePct,
+    isStaleData: false,
+    asOf: quote.as_of,
+  };
+}
 
 export const MarketContextService = {
 
@@ -114,7 +174,7 @@ export const MarketContextService = {
     }
 
     // Near Close / Past Cutoff (15:15 - 15:30)
-    if (timeNum >= config.intradayCutoff && timeNum <= config.marketClose) {
+    if (timeNum >= config.intradayCutoff && timeNum < config.marketClose) {
       return {
         status: 'NEAR CLOSE',
         isTradingAllowed: false, // Disallow new intraday positions
@@ -275,35 +335,26 @@ export const MarketContextService = {
         api.getPrice('^BSESN'),
       ]);
 
-      const parsePrice = (res, fallback) => {
-        if (res.status === 'fulfilled' && res.value && res.value.price && res.value.price !== 'N/A') {
-          return {
-            symbol: fallback.symbol,
-            name: fallback.name,
-            price: parseFloat(res.value.price || fallback.price),
-            change: parseFloat(res.value.change || fallback.change),
-            changePct: parseFloat(res.value.pct || fallback.changePct),
-          };
-        }
-        return fallback;
-      };
-
-      const nifty = parsePrice(niftyRes, DEFAULT_INDICES[0]);
-      const bank = parsePrice(bankRes, DEFAULT_INDICES[1]);
-      const sensex = parsePrice(sensexRes, DEFAULT_INDICES[2]);
-
-      const regime = this.determineMarketRegime(nifty.changePct, bank.changePct);
+      const nifty = parseFreshIndex(niftyRes, INDEX_DEFINITIONS[0]);
+      const bank = parseFreshIndex(bankRes, INDEX_DEFINITIONS[1]);
+      const sensex = parseFreshIndex(sensexRes, INDEX_DEFINITIONS[2]);
+      const benchmarkIsFresh = !nifty.isStaleData && !bank.isStaleData;
+      const regime = benchmarkIsFresh
+        ? this.determineMarketRegime(nifty.changePct, bank.changePct)
+        : neutralUnavailableRegime();
 
       return {
         indices: [nifty, bank, sensex],
         regime,
+        isStaleData: !benchmarkIsFresh,
         timestamp: new Date().toISOString(),
       };
     } catch (err) {
-      console.warn('MarketContextService: Failed to fetch live index quotes, using baseline:', err);
+      console.warn('MarketContextService: Failed to fetch live index quotes:', err);
       return {
-        indices: DEFAULT_INDICES,
-        regime: this.determineMarketRegime(DEFAULT_INDICES[0].changePct, DEFAULT_INDICES[1].changePct),
+        indices: INDEX_DEFINITIONS.map(unavailableIndex),
+        regime: neutralUnavailableRegime(),
+        isStaleData: true,
         timestamp: new Date().toISOString(),
       };
     }

@@ -292,7 +292,8 @@ def verify_user(username, password):
     # Allow logging in by either username or email
     c.execute(
         "SELECT id, password FROM users "
-        "WHERE username = ? OR lower(email) = lower(?) ORDER BY username = ? DESC LIMIT 1",
+        "WHERE lower(username) = lower(?) OR lower(email) = lower(?) "
+        "ORDER BY lower(username) = lower(?) DESC LIMIT 1",
         (identifier, identifier, identifier),
     )
     user = c.fetchone()

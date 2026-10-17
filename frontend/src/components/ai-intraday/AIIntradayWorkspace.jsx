@@ -51,7 +51,7 @@ function getIndianMarketState() {
   }
 
   // Market Hours: 09:15 - 15:30 IST
-  if (timeNum >= 915 && timeNum <= 1530) {
+  if (timeNum >= 915 && timeNum < 1530) {
     return { status: 'MARKET OPEN', color: 'var(--green)', isLive: true, note: 'Live Trading Session (09:15-15:30 IST)' };
   }
 
@@ -144,8 +144,9 @@ export default function AIIntradayWorkspace({ symbol, userId, onBack, onSelectSy
       stopLoss: tradeDecision.stopLoss,
       settings: riskSettings,
       currentExposure: account.usedCapital,
+      executionConfig: account.config,
     });
-  }, [tradeDecision, account.accountValue, account.availableCash, account.usedCapital, riskSettings]);
+  }, [tradeDecision, account.accountValue, account.availableCash, account.usedCapital, account.config, riskSettings]);
 
   // Auto-start background session if not already created
   const startedRef = useRef(new Set());

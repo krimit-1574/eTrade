@@ -2,11 +2,14 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
 
 from eta_backend import database as db
+from eta_backend import ai_engine
+from eta_backend import market_data
 from eta_backend import pdf_export
 from eta_backend import quant_engine
 from eta_backend import stock_screener
@@ -61,6 +64,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertIsNone(db.create_user("shared@example.com", "password123", "second@example.com"))
         self.assertIsNone(db.create_user("bob", "password123", "ALICE"))
         self.assertEqual(db.verify_user("shared@example.com", "password123"), first)
+        self.assertEqual(db.verify_user("ALICE", "password123"), first)
 
     def test_watchlist_add_is_idempotent_and_toggle_removes_membership(self):
         user_id = db.create_user("watcher", "password123")
@@ -80,18 +84,104 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(db.get_portfolio(user_id)[0]["quantity"], 2)
         self.assertEqual(db.get_paper_positions(user_id)[0]["quantity"], 3)
 
-    def test_ai_session_owner_cannot_be_replaced(self):
+    def test_ai_session_ids_are_scoped_per_owner_and_preserve_timeline(self):
         first = db.create_user("first", "password123")
         second = db.create_user("second", "password123")
-        payload = {"id": "session-1", "symbol": "TCS", "start_time": "now"}
-        db.save_ai_session(payload, first)
-        with self.assertRaises(PermissionError):
-            db.save_ai_session(payload, second)
-        self.assertIsNotNone(db.get_ai_session("session-1", first))
-        self.assertIsNone(db.get_ai_session("session-1", second))
+        first_payload = {
+            "id": "session-1",
+            "symbol": "TCS",
+            "start_time": "now",
+            "timeline": [{"title": "first owner event"}],
+        }
+        second_payload = {
+            "id": "session-1",
+            "symbol": "INFY",
+            "start_time": "now",
+            "timeline": [{"title": "second owner event"}],
+        }
+        db.save_ai_session(first_payload, first)
+        db.save_ai_session(second_payload, second)
+
+        first_session = db.get_ai_session("session-1", first)
+        second_session = db.get_ai_session("session-1", second)
+        self.assertEqual(first_session["symbol"], "TCS")
+        self.assertEqual(first_session["timeline"], first_payload["timeline"])
+        self.assertEqual(second_session["symbol"], "INFY")
+        self.assertEqual(second_session["timeline"], second_payload["timeline"])
 
 
 class OutputValidationTests(unittest.TestCase):
+    def test_analysis_output_is_object_only_and_render_safe(self):
+        with self.assertRaises(ValueError):
+            ai_engine._validate_analysis_payload([{"symbol": "BAD"}])
+
+        result = ai_engine._validate_analysis_payload({
+            "companyName": {"unexpected": "object"},
+            "symbol": "test.ns",
+            "bullCase": "not-a-list",
+            "bearCase": [{"title": "Risk", "detail": {"nested": True}}, "bad-item"],
+            "redFlags": {"not": "a-list"},
+            "aiScore": 999,
+            "scoreBreak": {"risk": float("nan"), "growth": -20},
+            "bullishPct": 80,
+            "bearishPct": 80,
+            "advice": {"add": "false", "reasoning": ["not", "renderable"]},
+        })
+
+        self.assertEqual(result["companyName"], "")
+        self.assertEqual(result["symbol"], "TEST.NS")
+        self.assertEqual(result["bullCase"], [])
+        self.assertEqual(result["bearCase"], [{"title": "Risk", "detail": ""}])
+        self.assertEqual(result["redFlags"], [])
+        self.assertEqual(result["aiScore"], 100)
+        self.assertEqual(result["scoreBreak"]["risk"], 0)
+        self.assertEqual(result["scoreBreak"]["growth"], 0)
+        self.assertEqual((result["bullishPct"], result["bearishPct"]), (50.0, 50.0))
+        self.assertFalse(result["advice"]["add"])
+        self.assertEqual(result["advice"]["reasoning"], "")
+
+    def test_three_minute_history_is_resampled_and_fallback_is_annotated(self):
+        index = pd.date_range("2026-10-14 09:15", periods=6, freq="min", tz="Asia/Kolkata")
+        frame = pd.DataFrame({
+            "Open": [100, 101, 102, 103, 104, 105],
+            "High": [101, 102, 103, 104, 105, 106],
+            "Low": [99, 100, 101, 102, 103, 104],
+            "Close": [100.5, 101.5, 102.5, 103.5, 104.5, 105.5],
+            "Volume": [10, 20, 30, 40, 50, 60],
+        }, index=index)
+
+        resampled = market_data._resample_three_minute_bars(frame)
+        annotated = market_data._annotate_history(
+            resampled, "1m", "15m", is_fallback=True, reason="test fallback"
+        )
+
+        self.assertEqual(len(resampled), 2)
+        self.assertEqual(float(resampled.iloc[0]["Volume"]), 60)
+        self.assertTrue(annotated.attrs["is_fallback"])
+        self.assertEqual(annotated.attrs["effective_interval"], "15m")
+
+    def test_date_only_alpha_vantage_quote_is_never_execution_fresh(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "Global Quote": {
+                "03. high": "101",
+                "04. low": "99",
+                "05. price": "100",
+                "06. volume": "1000",
+                "07. latest trading day": "2026-10-16",
+                "09. change": "1",
+                "10. change percent": "1%",
+            }
+        }
+        with patch.object(market_data.requests, "get", return_value=response), patch.object(
+            market_data, "get_yf_price", return_value=None
+        ):
+            quote = market_data.fetch_price("TEST.NS", "key")
+
+        self.assertTrue(quote["is_delayed"])
+        self.assertEqual(quote["as_of_precision"], "date")
+
     def test_intraday_ai_output_rejects_hallucinations_and_invalid_levels(self):
         candidates = [intraday_candidate("GOOD.NS"), intraday_candidate("BACKUP.NS", 200)]
         picks = [

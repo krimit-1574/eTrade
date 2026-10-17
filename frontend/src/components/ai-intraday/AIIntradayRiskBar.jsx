@@ -29,7 +29,7 @@ export default function AIIntradayRiskBar({
   // Only show sizing calculated for the current signal.
   const plannedQty = Math.max(0, finiteOr(calculatedSizing?.quantity));
 
-  const isDailyLimitNear = remainingDailyLoss < (maxDailyLoss * 0.3);
+  const isDailyLimitNear = maxDailyLoss === 0 || remainingDailyLoss <= (maxDailyLoss * 0.3);
 
   return (
     <div 

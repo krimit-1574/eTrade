@@ -29,6 +29,7 @@ describe('PositionManager', () => {
       target2: 1060,        // T2 = +3.0R (60 points)
       partialExits: [],
       breakevenMoved: false,
+      entryTime: new Date().toISOString(),
     };
   });
 
@@ -38,7 +39,7 @@ describe('PositionManager', () => {
         position: mockPosition,
         currentPrice: 978,
         candleLow: 975,
-        riskSettings: { intradayCutoffTime: '23:59' },
+        riskSettings: { bypassCutoff: true },
       });
 
       expect(evaluation.action).toBe(POSITION_DECISION.EXIT);
@@ -51,7 +52,7 @@ describe('PositionManager', () => {
         position: mockPosition,
         currentPrice: 1005,
         candleLow: 998,
-        riskSettings: { intradayCutoffTime: '23:59' },
+        riskSettings: { bypassCutoff: true },
       });
 
       expect(evaluation.action).toBe(POSITION_DECISION.HOLD);
@@ -64,7 +65,7 @@ describe('PositionManager', () => {
         position: mockPosition,
         currentPrice: 1032,
         candleHigh: 1035,
-        riskSettings: { intradayCutoffTime: '23:59' },
+        riskSettings: { bypassCutoff: true },
       });
 
       expect(evaluation.action).toBe(POSITION_DECISION.PARTIAL_EXIT);
@@ -80,7 +81,7 @@ describe('PositionManager', () => {
         position: mockPosition,
         currentPrice: 1035,
         candleHigh: 1038,
-        riskSettings: { intradayCutoffTime: '23:59' },
+        riskSettings: { bypassCutoff: true },
       });
 
       // Does not trigger partial exit again
@@ -95,7 +96,7 @@ describe('PositionManager', () => {
         position: mockPosition,
         currentPrice: 1062,
         candleHigh: 1065,
-        riskSettings: { intradayCutoffTime: '23:59' },
+        riskSettings: { bypassCutoff: true },
       });
 
       expect(evaluation.action).toBe(POSITION_DECISION.TAKE_PROFIT);
@@ -110,7 +111,7 @@ describe('PositionManager', () => {
         position: mockPosition,
         currentPrice: 1015,
         candleHigh: 1016,
-        riskSettings: { intradayCutoffTime: '23:59' },
+        riskSettings: { bypassCutoff: true },
       });
 
       expect(evaluation.action).toBe(POSITION_DECISION.MOVE_TO_BREAKEVEN);
@@ -128,7 +129,7 @@ describe('PositionManager', () => {
         currentPrice: 1040,
         candleHigh: 1042,
         technicalAnalysis: { indicators: { atr: 10 } },
-        riskSettings: { intradayCutoffTime: '23:59' },
+        riskSettings: { bypassCutoff: true },
       });
 
       expect(evaluation.action).toBe(POSITION_DECISION.TRAIL_STOP);
@@ -156,7 +157,7 @@ describe('PositionManager', () => {
         position: mockPosition,
         currentPrice: 1005,
         latestDecision: { decision: 'SHORT', confidence: 82 },
-        riskSettings: { intradayCutoffTime: '23:59' },
+        riskSettings: { bypassCutoff: true },
       });
 
       expect(evaluation.action).toBe(POSITION_DECISION.EXIT);
@@ -171,7 +172,7 @@ describe('PositionManager', () => {
         technicalAnalysis: {
           structure: { breakOfStructure: 'BEARISH_BOS' }
         },
-        riskSettings: { intradayCutoffTime: '23:59' },
+        riskSettings: { bypassCutoff: true },
       });
 
       expect(evaluation.action).toBe(POSITION_DECISION.EXIT);

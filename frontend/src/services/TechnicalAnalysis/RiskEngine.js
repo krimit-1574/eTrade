@@ -143,12 +143,56 @@ function getIstParts(value = null) {
   };
 }
 
-function isTradeFromDate(record, dateKey) {
-  const timestamp = record?.exitTime || record?.entryTime || record?.filledAt || record?.createdAt;
+function isTradeEnteredOnDate(record, dateKey) {
+  const timestamp = record?.entryTime || record?.filledAt || record?.createdAt || record?.exitTime;
   // Undated legacy rows cannot safely be charged against every future trading
   // day. They remain in history but are excluded from date-scoped limits.
   if (!timestamp) return false;
   return getIstParts(timestamp)?.dateKey === dateKey;
+}
+
+function isTradeExitedOnDate(record, dateKey) {
+  const timestamp = record?.exitTime || record?.entryTime || record?.filledAt || record?.createdAt;
+  if (!timestamp) return false;
+  return getIstParts(timestamp)?.dateKey === dateKey;
+}
+
+function quoteMetadataIsFresh(stockInfo, currentTime = null) {
+  if (!stockInfo || typeof stockInfo !== 'object') return true;
+  const hasMetadata = stockInfo.quoteAsOf != null
+    || stockInfo.quoteAsOfPrecision != null
+    || stockInfo.quoteFreshnessLimitSeconds != null;
+  // Direct/manual RiskEngine callers may not have provider metadata. The
+  // session manager supplies it and is required to fail closed when it does.
+  if (!hasMetadata) return true;
+  if (stockInfo.quoteAsOfPrecision !== 'timestamp' || !stockInfo.quoteAsOf) return false;
+  const quoteTime = new Date(stockInfo.quoteAsOf).getTime();
+  const referenceTime = currentTime == null ? Date.now() : new Date(currentTime).getTime();
+  if (!Number.isFinite(quoteTime) || !Number.isFinite(referenceTime)) return false;
+  const advertisedLimit = asFiniteNumber(stockInfo.quoteFreshnessLimitSeconds);
+  const maxAgeMs = Math.min(90_000, (advertisedLimit !== null && advertisedLimit > 0 ? advertisedLimit : 90) * 1000);
+  const ageMs = referenceTime - quoteTime;
+  return ageMs >= -30_000 && ageMs <= maxAgeMs;
+}
+
+function executionAdjustedRiskReward({ direction, entry, stopLoss, target, quantity, executionConfig }) {
+  if (!Number.isInteger(quantity) || quantity <= 0) return 0;
+  const slippage = Math.max(0, asFiniteNumber(executionConfig?.slippage) ?? 0);
+  const spread = Math.max(0, asFiniteNumber(executionConfig?.spread) ?? 0);
+  const commission = Math.max(0, asFiniteNumber(executionConfig?.commission) ?? 0);
+  const frictionRate = slippage + (spread / 2);
+  const roundedFill = (price, multiplier) => parseFloat((price * multiplier).toFixed(2));
+
+  const entryFill = roundedFill(entry, direction === 'LONG' ? 1 + frictionRate : 1 - frictionRate);
+  const stopFill = roundedFill(stopLoss, direction === 'LONG' ? 1 - frictionRate : 1 + frictionRate);
+  const targetFill = roundedFill(target, direction === 'LONG' ? 1 - frictionRate : 1 + frictionRate);
+  const perShareRisk = direction === 'LONG' ? entryFill - stopFill : stopFill - entryFill;
+  const perShareReward = direction === 'LONG' ? targetFill - entryFill : entryFill - targetFill;
+  if (perShareRisk <= 0 || perShareReward <= 0) return 0;
+
+  const netRisk = (perShareRisk * quantity) + (commission * 2);
+  const netReward = (perShareReward * quantity) - (commission * 2);
+  return netRisk > 0 && netReward > 0 ? netReward / netRisk : 0;
 }
 
 export const RiskEngine = {
@@ -277,7 +321,15 @@ export const RiskEngine = {
    * - Maximum capital per trade allocation
    * - Commission buffer
    */
-  calculatePositionSize({ accountValue, availableCash, entryPrice, stopLoss, settings, currentExposure = 0 } = {}) {
+  calculatePositionSize({
+    accountValue,
+    availableCash,
+    entryPrice,
+    stopLoss,
+    settings,
+    currentExposure = 0,
+    executionConfig = null,
+  } = {}) {
     const config = normalizeRiskSettings(settings || this.loadSettings());
     const entry = asFiniteNumber(entryPrice);
     const stop = asFiniteNumber(stopLoss);
@@ -304,33 +356,43 @@ export const RiskEngine = {
     // 1. Calculate nominal monetary risk allowance
     const riskAmount = totalEquity * (config.maxRiskPerTradePct / 100);
 
-    // 2. Per-share risk distance
-    const perShareRisk = Math.abs(entry - stop);
+    // 2. Per-share risk distance. When broker execution settings are
+    // available, include adverse entry/exit friction and both commissions so
+    // the eventual simulated fill cannot silently exceed the configured risk.
+    const slippage = Math.max(0, asFiniteNumber(executionConfig?.slippage) ?? 0);
+    const spread = Math.max(0, asFiniteNumber(executionConfig?.spread) ?? 0);
+    const commission = Math.max(0, asFiniteNumber(executionConfig?.commission) ?? 0);
+    const frictionRate = slippage + (spread / 2);
+    const entryCapitalPrice = entry * (1 + frictionRate);
+    const perShareRisk = Math.abs(entry - stop) + ((entry + stop) * frictionRate);
+    const roundTripCommission = commission * 2;
     if (perShareRisk <= 0) {
       return { quantity: 0, riskAmount: 0, capitalRequired: 0, constrainedBy: 'ZERO_PER_SHARE_RISK' };
     }
 
     // 3. Raw quantity from risk equation
-    let rawQty = Math.floor(riskAmount / perShareRisk);
+    let rawQty = Math.floor(Math.max(0, riskAmount - roundTripCommission) / perShareRisk);
 
     // 4. Maximum capital allocation constraint
     const maxCapitalAllowed = totalEquity * (config.maxCapitalPerTradePct / 100);
-    const maxAffordableByAllocation = Math.floor(maxCapitalAllowed / entry);
+    const maxAffordableByAllocation = Math.floor(maxCapitalAllowed / entryCapitalPrice);
 
     // 5. Total exposure constraint (Rule: maxTotalExposurePct, e.g. 80%)
     const maxTotalExposurePct = config.maxTotalExposurePct;
     const remainingExposure = Math.max(0, (totalEquity * maxTotalExposurePct / 100) - exposure);
-    const maxAffordableByExposure = Math.floor(remainingExposure / entry);
+    const maxAffordableByExposure = Math.floor(remainingExposure / entryCapitalPrice);
 
     // 6. Hard cash constraint (leaving ₹50 buffer for fees & slippage)
-    const maxAffordableByCash = Math.floor(Math.max(0, cash - 50) / (entry * 1.002));
+    const maxAffordableByCash = Math.floor(
+      Math.max(0, cash - Math.max(50, commission)) / Math.max(entryCapitalPrice, entry * 1.002)
+    );
 
     // 7. Constrain quantity
     let quantity = Math.min(rawQty, maxAffordableByAllocation, maxAffordableByExposure, maxAffordableByCash);
     quantity = Math.max(0, quantity);
 
-    const capitalRequired = parseFloat((quantity * entry).toFixed(2));
-    const actualRisk = parseFloat((quantity * perShareRisk).toFixed(2));
+    const capitalRequired = parseFloat(((quantity * entryCapitalPrice) + (quantity > 0 ? commission : 0)).toFixed(2));
+    const actualRisk = parseFloat((quantity > 0 ? (quantity * perShareRisk) + roundTripCommission : 0).toFixed(2));
 
     let constrainedBy = 'RISK_FORMULA';
     if (quantity < rawQty) {
@@ -349,6 +411,7 @@ export const RiskEngine = {
       actualRisk,
       perShareRisk: parseFloat(perShareRisk.toFixed(2)),
       capitalRequired,
+      estimatedRoundTripCommission: parseFloat((quantity > 0 ? roundTripCommission : 0).toFixed(2)),
       constrainedBy,
       remainingExposure: parseFloat(remainingExposure.toFixed(2)),
     };
@@ -463,6 +526,9 @@ export const RiskEngine = {
     if (stockInfo?.isStaleData === true || marketState?.isStaleData === true || marketState?.stale === true) {
       return { approved: false, code: REJECTION_CODES.STALE_DATA, reason: 'Market data is stale or disconnected.' };
     }
+    if (!quoteMetadataIsFresh(stockInfo, currentTime)) {
+      return { approved: false, code: REJECTION_CODES.STALE_DATA, reason: 'Provider quote timestamp is missing or stale.' };
+    }
 
     const entry = asFiniteNumber(decision.entry);
     const stopLoss = asFiniteNumber(decision.stopLoss);
@@ -536,12 +602,13 @@ export const RiskEngine = {
 
     const closed = Array.isArray(account.closedPositions) ? account.closedPositions : [];
     const dateKey = nowParts?.dateKey;
-    const todayClosed = dateKey ? closed.filter(trade => isTradeFromDate(trade, dateKey)) : closed;
-    const todayActive = dateKey ? activeList.filter(trade => isTradeFromDate(trade, dateKey)) : activeList;
+    const todayEntries = dateKey ? closed.filter(trade => isTradeEnteredOnDate(trade, dateKey)) : closed;
+    const todayExits = dateKey ? closed.filter(trade => isTradeExitedOnDate(trade, dateKey)) : closed;
+    const todayActive = dateKey ? activeList.filter(trade => isTradeEnteredOnDate(trade, dateKey)) : activeList;
 
     // 5. Maximum Daily Trades. Count filled open entries as trades too; counting
     // only closed positions allowed maxTradesPerDay + maxPositions entries.
-    if (todayClosed.length + todayActive.length >= settings.maxTradesPerDay) {
+    if (todayEntries.length + todayActive.length >= settings.maxTradesPerDay) {
       return { 
         approved: false, 
         code: REJECTION_CODES.MAX_DAILY_TRADES, 
@@ -550,7 +617,8 @@ export const RiskEngine = {
     }
 
     // 6. Maximum Trades per Stock (Symbol Specific)
-    const symbolTrades = todayClosed.filter(p => normalizeSymbol(p.symbol) === cleanSym);
+    const symbolTrades = todayEntries.filter(p => normalizeSymbol(p.symbol) === cleanSym);
+    const symbolExits = todayExits.filter(p => normalizeSymbol(p.symbol) === cleanSym);
     const activeSymbolTrades = todayActive.filter(p => normalizeSymbol(p.symbol) === cleanSym);
     if (symbolTrades.length + activeSymbolTrades.length >= settings.maxTradesPerStock) {
       return { 
@@ -561,8 +629,8 @@ export const RiskEngine = {
     }
 
     // 7. Maximum Consecutive Losses Protection
-    if (settings.maxConsecutiveLosses > 0 && todayClosed.length >= settings.maxConsecutiveLosses) {
-      const recentTrades = todayClosed.slice(-settings.maxConsecutiveLosses);
+    if (settings.maxConsecutiveLosses > 0 && todayExits.length >= settings.maxConsecutiveLosses) {
+      const recentTrades = todayExits.slice(-settings.maxConsecutiveLosses);
       const allLosses = recentTrades.every(t => (asFiniteNumber(t.realizedPnL) ?? 0) < 0);
       if (allLosses) {
         return { 
@@ -574,8 +642,8 @@ export const RiskEngine = {
     }
 
     // 8. Cooldown & Anti-Revenge Trading Guard
-    if (symbolTrades.length > 0) {
-      const lastTrade = symbolTrades[symbolTrades.length - 1];
+    if (symbolExits.length > 0) {
+      const lastTrade = symbolExits[symbolExits.length - 1];
       if (lastTrade.exitTime) {
         const exitTimeMs = new Date(lastTrade.exitTime).getTime();
         const diffMinutes = Number.isFinite(exitTimeMs)
@@ -620,20 +688,20 @@ export const RiskEngine = {
     const calculatedRR = stopDistance > 0 ? targetDistance / stopDistance : 0;
     const reportedRR = asFiniteNumber(decision.riskReward);
     // Never trust an AI-reported ratio that is more optimistic than its actual levels.
-    const rawTradeRR = reportedRR !== null && reportedRR >= 0
+    const quotedTradeRR = reportedRR !== null && reportedRR >= 0
       ? Math.min(reportedRR, calculatedRR)
       : calculatedRR;
-    const tradeRR = parseFloat(rawTradeRR.toFixed(2));
+    const quotedTradeRRDisplay = parseFloat(quotedTradeRR.toFixed(2));
 
     // Prices are stored to paise precision, so an exact 1.50 setup can be
     // represented as 1.499999999999995 in binary floating point. Keep the
     // comparison strict for materially sub-threshold trades while tolerating
     // only machine-level rounding noise.
-    if (rawTradeRR + Number.EPSILON * 100 < settings.minRiskReward) {
+    if (quotedTradeRR + Number.EPSILON * 100 < settings.minRiskReward) {
       return { 
         approved: false, 
         code: REJECTION_CODES.POOR_RISK_REWARD, 
-        reason: `Risk/Reward (${tradeRR}:1) is below required minimum (${settings.minRiskReward}:1).` 
+        reason: `Risk/Reward (${quotedTradeRRDisplay}:1) is below required minimum (${settings.minRiskReward}:1).`
       };
     }
 
@@ -660,6 +728,7 @@ export const RiskEngine = {
       stopLoss,
       settings,
       currentExposure,
+      executionConfig: account.config,
     });
 
     if (sizeResult.quantity < 1) {
@@ -670,6 +739,27 @@ export const RiskEngine = {
         reason: isExposureConstraint
           ? `Trade exceeds maximum total exposure allowance (${settings.maxTotalExposurePct || 80}%).`
           : `Calculated position size is 0 shares. Insufficient cash or risk allowance.` 
+      };
+    }
+
+    // Re-check reward/risk using the same adverse fills and flat commissions
+    // that the paper broker will apply. A quote-level 1.5R setup can otherwise
+    // become sub-threshold by the time it is actually simulated.
+    const modeledRR = executionAdjustedRiskReward({
+      direction: expectedDirection,
+      entry,
+      stopLoss,
+      target: target1,
+      quantity: sizeResult.quantity,
+      executionConfig: account.config,
+    });
+    const rawTradeRR = Math.min(quotedTradeRR, modeledRR);
+    const tradeRR = parseFloat(rawTradeRR.toFixed(2));
+    if (rawTradeRR + Number.EPSILON * 100 < settings.minRiskReward) {
+      return {
+        approved: false,
+        code: REJECTION_CODES.POOR_RISK_REWARD,
+        reason: `Execution-adjusted Risk/Reward (${tradeRR}:1) is below required minimum (${settings.minRiskReward}:1).`,
       };
     }
 

@@ -8,8 +8,10 @@ vi.mock('../../../api', () => ({
       change: '0',
       pct: '0',
       as_of: new Date().toISOString(),
+      as_of_precision: 'timestamp',
       provider: 'test',
       is_delayed: false,
+      freshness_limit_seconds: 90,
     })),
     getHistory: vi.fn(async () => ({ data: [] })),
     saveAISession: vi.fn(async () => ({ status: 'ok' })),
@@ -19,6 +21,8 @@ vi.mock('../../../api', () => ({
 }));
 
 import { AISessionManagerSingleton, SESSION_STATUS } from '../AISessionManager';
+import { PaperBroker } from '../PaperBroker';
+import { api } from '../../../api';
 
 function createStorage() {
   const values = {};
@@ -76,6 +80,19 @@ describe('AISessionManager lifecycle', () => {
   let manager;
 
   beforeEach(() => {
+    vi.clearAllMocks();
+    api.getPrice.mockImplementation(async (symbol) => ({
+      symbol,
+      price: '100.00',
+      change: '0',
+      pct: '0',
+      as_of: new Date().toISOString(),
+      as_of_precision: 'timestamp',
+      provider: 'test',
+      is_delayed: false,
+      freshness_limit_seconds: 90,
+    }));
+    api.getHistory.mockResolvedValue({ data: [] });
     globalThis.localStorage = createStorage();
     globalThis.sessionStorage = createStorage();
     localStorage.setItem('eTA_user', JSON.stringify({ user_id: 'user-1' }));
@@ -97,7 +114,16 @@ describe('AISessionManager lifecycle', () => {
     expect(manager.getSession('TCS').isStaleData).toBe(true);
   });
 
-  it('blocks an entry when the last successful quote is too old', async () => {
+  it('attaches a legacy position to its rehydrated session and prevents immediate re-entry', () => {
+    const position = openPosition({ sessionId: undefined });
+    manager.initialize(accountWithPositions([position]), { maxSimultaneousPositions: 4 }, 'user-1');
+
+    const session = manager.getSession('TCS');
+    expect(position.sessionId).toBe(session.id);
+    expect(session.hasExecuted).toBe(true);
+  });
+
+  it('blocks an entry when the provider quote timestamp is too old', async () => {
     manager.initialize(accountWithPositions(), {
       maxSimultaneousPositions: 4,
       bypassMarketHours: true,
@@ -113,7 +139,10 @@ describe('AISessionManager lifecycle', () => {
     session._priceStale = false;
     session._candleStale = false;
     session.isStaleData = false;
-    session.lastTickTime = Date.now() - 31_000;
+    session.lastTickTime = Date.now();
+    session.quoteAsOf = new Date(Date.now() - 91_000).toISOString();
+    session.quoteAsOfPrecision = 'timestamp';
+    session.quoteFreshnessLimitSeconds = 90;
 
     await manager._attemptTradeExecution('TCS', decision, session);
 
@@ -147,5 +176,80 @@ describe('AISessionManager lifecycle', () => {
     expect(closed).toBe(true);
     expect(manager.getAccount().activePositions).toHaveLength(0);
     expect(manager.getAccount().closedPositions[0].exitPrice).toBe(105);
+  });
+
+  it('keeps a failed automatic exit active and records the failure', async () => {
+    const position = openPosition({ currentPrice: 90, entryTime: new Date().toISOString() });
+    manager.initialize(accountWithPositions([position]), { maxSimultaneousPositions: 4, bypassCutoff: true }, 'user-1');
+    const session = manager.getSession('TCS');
+    session.price = 90;
+    vi.spyOn(PaperBroker, 'closePosition').mockReturnValue({
+      account: manager.getAccount(),
+      closedFully: false,
+      events: [],
+      reason: 'simulated broker rejection',
+    });
+
+    await manager._evaluatePosition('TCS', session);
+
+    expect(manager.getAccount().activePositions).toHaveLength(1);
+    expect(session.status).toBe(SESSION_STATUS.POSITION_ACTIVE);
+    expect(session.timeline.at(-1).title).toBe('Automatic exit failed');
+  });
+
+  it('marks a backend timeframe fallback as display-only stale data', async () => {
+    api.getHistory.mockResolvedValue({
+      data: [{ time: 1, open: 100, high: 101, low: 99, close: 100, volume: 10 }],
+      requestedInterval: '5m',
+      effectiveInterval: '15m',
+      isFallback: true,
+      fallbackReason: 'test fallback',
+    });
+    manager.initialize(accountWithPositions(), { maxSimultaneousPositions: 4 }, 'user-1');
+    const session = manager.startSession('TCS', { timeframe: '5m' });
+
+    await manager.refreshSession('TCS');
+
+    expect(session.chartData).toHaveLength(1);
+    expect(session.dataInterval).toBe('15m');
+    expect(session.isStaleData).toBe(true);
+    expect(session.technicalAnalysis).toBeNull();
+  });
+
+  it('treats prior-session candles as display-only even when the interval matches', async () => {
+    api.getHistory.mockResolvedValue({
+      data: [{
+        time: Math.floor((Date.now() - (20 * 60_000)) / 1000),
+        open: 100,
+        high: 101,
+        low: 99,
+        close: 100,
+        volume: 10,
+      }],
+      requestedInterval: '5m',
+      effectiveInterval: '5m',
+      isFallback: false,
+    });
+    manager.initialize(accountWithPositions(), { maxSimultaneousPositions: 4 }, 'user-1');
+    const session = manager.startSession('TCS', { timeframe: '5m' });
+
+    await manager.refreshSession('TCS');
+
+    expect(session.chartData).toHaveLength(1);
+    expect(session.candleAsOf).toBeTruthy();
+    expect(session.isStaleData).toBe(true);
+    expect(session.fallbackReason).toContain('candle is stale');
+    expect(session.technicalAnalysis).toBeNull();
+  });
+
+  it('does not tear down monitoring when shutdown cannot liquidate a position', async () => {
+    const position = openPosition({ entryPrice: 0, currentPrice: 0 });
+    manager.initialize(accountWithPositions([position]), { maxSimultaneousPositions: 4 }, 'user-1');
+    manager.getSession('TCS').price = 0;
+
+    await expect(manager.shutdown()).rejects.toMatchObject({ code: 'LIQUIDATION_INCOMPLETE' });
+
+    expect(manager.getSession('TCS')?.isActive).toBe(true);
+    expect(manager.getAccount().activePositions).toHaveLength(1);
   });
 });

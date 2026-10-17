@@ -158,7 +158,8 @@ describe('Technical Analysis Engine', () => {
       // Support is 95, so we use support 95 (actually 0.2% below it = 94.81) if it's within max stop.
       // But 100 to 94.81 is > 2% max stop. So max stop is 100 * 0.98 = 98.
       expect(risk.stopLoss).toBe(98);
-      expect(risk.target1).toBe(103);
+      expect(risk.target1).toBe(105);
+      expect(risk.target2).toBe(108);
     });
   });
 

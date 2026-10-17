@@ -377,6 +377,20 @@ describe('Paper Trading Engine', () => {
       expect(result.filledOrders[0].fillPrice).toBe(110);
       expect(account.activePositions[0].entryPrice).toBe(110);
     });
+
+    it('gives limit entries price improvement through a favorable gap', () => {
+      account = PaperTradingAccount.reset({ initialCapital: 100000, maxSimultaneousPositions: 4, slippage: 0, spread: 0, commission: 0 });
+      PaperBroker.createLimitOrder(account, {
+        symbol: 'AAA', direction: 'LONG', limitPrice: 100,
+        quantity: 10, stopLoss: 90, target1: 120,
+      });
+
+      const result = PaperBroker.evaluatePendingOrders(account, 95, 97, 94, 'AAA');
+
+      expect(result.filledOrders).toHaveLength(1);
+      expect(result.filledOrders[0].fillPrice).toBe(95);
+      expect(account.activePositions[0].entryPrice).toBe(95);
+    });
   });
 
   describe('PaperBroker - P&L Accounting', () => {
@@ -411,6 +425,8 @@ describe('Paper Trading Engine', () => {
       });
 
       expect(PaperBroker.closePosition(account, 110, 'Bad partial', 0.5).closedFully).toBe(false);
+      expect(PaperBroker.closePosition(account, 110, 'Bad partial', 'bad').closedFully).toBe(false);
+      expect(PaperBroker.closePosition(account, 110, 'Bad partial', Number.NaN).closedFully).toBe(false);
       expect(PaperBroker.closePosition(account, Number.NaN, 'Bad price').closedFully).toBe(false);
       expect(account.activePosition.quantity).toBe(10);
       expect(account.realizedPnL).toBe(-20);

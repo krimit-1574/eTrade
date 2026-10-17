@@ -83,6 +83,25 @@ describe('RiskEngine', () => {
 
       expect(sizing.quantity).toBe(0);
     });
+
+    it('keeps estimated stop risk within the limit after slippage and commissions', () => {
+      const sizing = RiskEngine.calculatePositionSize({
+        accountValue: 100000,
+        availableCash: 100000,
+        entryPrice: 100,
+        stopLoss: 95,
+        settings: {
+          ...defaultSettings,
+          maxCapitalPerTradePct: 100,
+          maxTotalExposurePct: 100,
+        },
+        executionConfig: { slippage: 0.001, spread: 0.002, commission: 20 },
+      });
+
+      expect(sizing.quantity).toBeLessThan(200);
+      expect(sizing.actualRisk).toBeLessThanOrEqual(sizing.riskAmount);
+      expect(sizing.estimatedRoundTripCommission).toBe(40);
+    });
   });
 
   describe('Structural Stop-Loss Determination', () => {
@@ -281,6 +300,59 @@ describe('RiskEngine', () => {
       expect(validation.code).toBe(REJECTION_CODES.STALE_DATA);
     });
 
+    it('fails closed when provider quote metadata is stale or date-only', () => {
+      const stale = RiskEngine.validateTrade({
+        account: mockAccount,
+        decision: validDecision,
+        stockInfo: {
+          sym: 'RELIANCE',
+          quoteAsOf: new Date(new Date(MARKET_OPEN_TIME).getTime() - 91_000).toISOString(),
+          quoteAsOfPrecision: 'timestamp',
+          quoteFreshnessLimitSeconds: 90,
+        },
+        customSettings: { ...defaultSettings, tradingStartTime: '00:00', intradayCutoffTime: '23:59' },
+        currentTime: MARKET_OPEN_TIME,
+      });
+      const dateOnly = RiskEngine.validateTrade({
+        account: mockAccount,
+        decision: validDecision,
+        stockInfo: {
+          sym: 'RELIANCE',
+          quoteAsOf: '2026-10-14',
+          quoteAsOfPrecision: 'date',
+        },
+        customSettings: { ...defaultSettings, tradingStartTime: '00:00', intradayCutoffTime: '23:59' },
+        currentTime: MARKET_OPEN_TIME,
+      });
+
+      expect(stale.code).toBe(REJECTION_CODES.STALE_DATA);
+      expect(dateOnly.code).toBe(REJECTION_CODES.STALE_DATA);
+    });
+
+    it('counts daily trade entries by entry date rather than an overnight exit date', () => {
+      mockAccount.closedPositions = [{
+        symbol: 'INFY',
+        entryTime: '2026-10-13T05:30:00.000Z',
+        exitTime: MARKET_OPEN_TIME,
+        realizedPnL: 100,
+      }];
+
+      const validation = RiskEngine.validateTrade({
+        account: mockAccount,
+        decision: validDecision,
+        stockInfo: { sym: 'RELIANCE' },
+        customSettings: {
+          ...defaultSettings,
+          tradingStartTime: '00:00',
+          intradayCutoffTime: '23:59',
+          maxTradesPerDay: 1,
+        },
+        currentTime: MARKET_OPEN_TIME,
+      });
+
+      expect(validation.approved).toBe(true);
+    });
+
     it('uses actual stop and target levels instead of trusting an optimistic reported ratio', () => {
       const validation = RiskEngine.validateTrade({
         account: mockAccount,
@@ -292,6 +364,32 @@ describe('RiskEngine', () => {
 
       expect(validation.approved).toBe(false);
       expect(validation.code).toBe(REJECTION_CODES.POOR_RISK_REWARD);
+    });
+
+    it('rejects a quote-level ratio that falls below the threshold after execution friction', () => {
+      mockAccount.config = { slippage: 0.001, spread: 0.002, commission: 0 };
+      const validation = RiskEngine.validateTrade({
+        account: mockAccount,
+        decision: {
+          ...validDecision,
+          entry: 100,
+          stopLoss: 99,
+          target1: 101.6,
+          riskReward: 1.6,
+        },
+        stockInfo: { sym: 'RELIANCE' },
+        customSettings: {
+          ...defaultSettings,
+          tradingStartTime: '00:00',
+          intradayCutoffTime: '23:59',
+          maxCapitalPerTradePct: 100,
+        },
+        currentTime: MARKET_OPEN_TIME,
+      });
+
+      expect(validation.approved).toBe(false);
+      expect(validation.code).toBe(REJECTION_CODES.POOR_RISK_REWARD);
+      expect(validation.reason).toContain('Execution-adjusted');
     });
 
     it('compares the unrounded risk/reward ratio at the configured boundary', () => {

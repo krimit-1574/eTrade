@@ -30,6 +30,12 @@ function App() {
     const handleUnauthorized = async () => {
       try {
         await AISessionManager.shutdown();
+      } catch (error) {
+        // Authentication is already invalid, so trading cannot remain attached
+        // to the signed-out identity. The position is still persisted and will
+        // be rehydrated on the next successful login.
+        console.warn('Forced logout could not liquidate every paper position', error);
+        AISessionManager.destroy();
       } finally {
         clearLocalSession();
       }
@@ -66,9 +72,20 @@ function App() {
       // Persist/liquidate active AI sessions while the bearer token is valid,
       // then revoke it server-side before clearing browser identity.
       await AISessionManager.shutdown();
+    } catch (error) {
+      console.warn('Logout paused because paper-position cleanup failed', error);
+      if (typeof window !== 'undefined' && typeof window.alert === 'function') {
+        window.alert('Logout was paused because an open paper position could not be closed. Please retry after market data recovers.');
+      }
+      return;
+    }
+
+    try {
       if (user?.user_id !== 'guest') await api.logout();
     } catch (error) {
-      console.warn('Logout cleanup did not fully complete', error);
+      // Local logout must still be possible if the backend is temporarily down;
+      // the short-lived bearer token will expire server-side.
+      console.warn('Server-side logout could not be completed', error);
     } finally {
       clearLocalSession();
     }

@@ -5,9 +5,9 @@
 
 export const StrategyConfig = {
   // Risk & Reward Constants
-  MIN_RISK_REWARD: 1.5,       // Target 1 must be at least 1.5x Risk
-  TARGET_1_MULTIPLIER: 1.5,   // Entry + (Risk * 1.5)
-  TARGET_2_MULTIPLIER: 2.5,   // Entry + (Risk * 2.5)
+  MIN_RISK_REWARD: 1.5,       // Net execution-adjusted ratio required by RiskEngine
+  TARGET_1_MULTIPLIER: 2.5,   // Buffer spread, slippage, and flat commissions above the 1.5R floor
+  TARGET_2_MULTIPLIER: 4.0,   // Preserve a distinct runner target beyond the partial exit
   
   // Stop Loss Calculation Constants
   ATR_STOP_MULTIPLIER: 1.5,   // SL is placed 1.5x ATR away from entry by default
